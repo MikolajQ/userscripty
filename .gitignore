@@ -1,0 +1,5 @@
+# Wszystko ignorowane poza userscriptami (w katalogu są też klucze, kopie i dane lokalne)
+*
+!.gitignore
+!README.md
+!*.user.js
