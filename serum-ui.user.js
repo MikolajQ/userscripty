@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.111.0
+// @version      3.112.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -21,7 +21,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.111.0';
+  const SCRIPT_VERSION = '3.112.0';
 
   // =====================================================================
   // MODUŁ: auto OK dialogi (dawniej serum-dialogs.user.js)
@@ -1021,6 +1021,41 @@
 
     ereceptSigned = true;
     dbg('modPodpiszERecepte: klik Podpisz');
+    signBtn.click();
+  }
+
+  // --- PODPISZ IPOM (okno „IPOM - DOKUMENT”, PIN wpisany → klik „Podpisz”) ---
+  // <div id="electronicIPOMPopup" class="popup-window show …"> … PIN: <input>
+  // <button class="button x-buttonSign" type="button">Podpisz</button>
+
+  let ipomSigned = false;
+  let ipomBrakPinuZalogowany = false;
+
+  function modPodpiszIpom() {
+    const popup = document.getElementById('electronicIPOMPopup');
+    if (!popup || !popup.classList.contains('show') || !isOverlayElementVisible(popup)) {
+      ipomSigned = false;
+      ipomBrakPinuZalogowany = false;
+      return;
+    }
+    if (ipomSigned) return;
+
+    const pin = [...popup.querySelectorAll('input[type="password"], input[id*="pin" i], input[name*="pin" i]')]
+      .find((el) => isOverlayElementVisible(el));
+    if (!pin) {
+      if (!ipomBrakPinuZalogowany) dbg('modPodpiszIpom: brak widocznego pola PIN w #electronicIPOMPopup');
+      ipomBrakPinuZalogowany = true;
+      return;
+    }
+    if (!/^\d{4,}$/.test(pin.value.trim())) return;
+
+    const signBtn = [...popup.querySelectorAll('button.x-buttonSign')].find(
+      (el) => isOverlayElementVisible(el) && normLabel(el.textContent) === 'Podpisz'
+    );
+    if (!signBtn || signBtn.disabled) return;
+
+    ipomSigned = true;
+    dbg('modPodpiszIpom: klik Podpisz');
     signBtn.click();
   }
 
@@ -5245,6 +5280,7 @@
     ['modWynikiOperacji', modWynikiOperacji],
     ['modWyslijSms', modWyslijSms],
     ['modPodpiszERecepte', modPodpiszERecepte],
+    ['modPodpiszIpom', modPodpiszIpom],
     ['modPueLogowanie', modPueLogowanie],
     ['modBladSesjiZus', modBladSesjiZus],
     ['modEzlaPobierzZus', modEzlaPobierzZus],
