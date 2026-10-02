@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.112.0
+// @version      3.113.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @grant        GM_setClipboard
 // @grant        unsafeWindow
 // @run-at       document-start
@@ -21,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.112.0';
+  const SCRIPT_VERSION = '3.113.0';
 
   // =====================================================================
   // MODUŁ: auto OK dialogi (dawniej serum-dialogs.user.js)
@@ -49,6 +51,8 @@
         return true;
       }
       if (s.includes('dokument został podpisany')) return true;
+      // „Wysłano do P1” po podpisaniu IPOM-u — samo powiadomienie.
+      if (s.trim().startsWith('wysłano do p1')) return true;
       if (s.includes('dokumenty zostały wysłane do zus')) return true;
       if (s.includes('zapisać świadczenie') && s.includes('odznaczony') && s.includes('kontynuować')) return true;
       // „Wróciły wyniki badań laboratoryjnych do zlecenia nr: 0003553105” —
@@ -70,6 +74,8 @@
         return true;
       }
       if (s.includes('dokument został podpisany')) return true;
+      // „Wysłano do P1” po podpisaniu IPOM-u — samo powiadomienie.
+      if (s.trim().startsWith('wysłano do p1')) return true;
       if (s.includes('dokumenty zostały wysłane do zus')) return true;
       if (s.includes('zapisać świadczenie') && s.includes('odznaczony') && s.includes('kontynuować')) return true;
       // „Nie podano kodu procedury ICD-9. Czy kontynuować?” przy zapisie
@@ -1061,7 +1067,36 @@
 
   // --- LOGOWANIE DO PUE (auto-PIN przy eZLA) ---
 
-  const PUE_PIN = '';
+  // PIN nie siedzi w kodzie (skrypt jest w publicznym repozytorium) — trzymany
+  // w pamięci Tampermonkeya. Pytamy o niego raz, przy pierwszej potrzebie;
+  // zmiana przez menu „Ustaw PIN do PUE ZUS (Serum)”.
+  const KLUCZ_PUE_PIN = 'serum_pue_pin';
+  let puePinPytano = false;
+
+  function zapytajOPuePin() {
+    const wpisany = window.prompt('PIN do PUE ZUS (Serum) — zostanie zapamiętany w Tampermonkey:', '');
+    if (wpisany == null) return '';
+    const kod = wpisany.trim();
+    if (!/^\d{4,}$/.test(kod)) {
+      window.alert('PIN musi składać się z cyfr — nie zapisano.');
+      return '';
+    }
+    GM_setValue(KLUCZ_PUE_PIN, kod);
+    return kod;
+  }
+
+  function puePin() {
+    const kod = GM_getValue(KLUCZ_PUE_PIN, '');
+    if (kod) return kod;
+    if (puePinPytano) return '';
+    puePinPytano = true;
+    return zapytajOPuePin();
+  }
+
+  GM_registerMenuCommand?.('Ustaw PIN do PUE ZUS (Serum)', () => {
+    if (zapytajOPuePin()) window.alert('Zapisano PIN do PUE ZUS.');
+  });
+
   // Zbyt szybkie zatwierdzenie PIN-u (tuż po pojawieniu się okienka) trafiało
   // czasem w moment, zanim strona zdążyła zainicjalizować sesję logowania do
   // PUE po swojej stronie. 500ms nie wystarczało, 2000ms już tak — ale skoro
@@ -1287,7 +1322,12 @@
   }
 
   function submitPueLogin(pin) {
-    pin.value = PUE_PIN;
+    const kod = puePin();
+    if (!kod) {
+      dbg('submitPueLogin: brak zapisanego PIN-u do PUE — wpisz ręcznie lub ustaw w menu');
+      return;
+    }
+    pin.value = kod;
     pin.dispatchEvent(new Event('input', { bubbles: true }));
     pin.dispatchEvent(new Event('change', { bubbles: true }));
     // Pole PIN bywa (po focusie) rozpoznawane przez przeglądarkę jako pole
@@ -1780,7 +1820,12 @@
     if (ezlaPodpisDone) return;
     ezlaPodpisDone = true;
 
-    pin.value = PUE_PIN;
+    const kod = puePin();
+    if (!kod) {
+      dbg('modEzlaPodpis: brak zapisanego PIN-u do PUE — wpisz ręcznie lub ustaw w menu');
+      return;
+    }
+    pin.value = kod;
     pin.dispatchEvent(new Event('input', { bubbles: true }));
     pin.dispatchEvent(new Event('change', { bubbles: true }));
     // Jak przy logowaniu do PUE — realne odjęcie fokusu, żeby ewentualna
