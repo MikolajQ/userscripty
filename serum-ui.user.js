@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.113.0
+// @version      3.114.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.113.0';
+  const SCRIPT_VERSION = '3.114.0';
 
   // =====================================================================
   // MODUŁ: auto OK dialogi (dawniej serum-dialogs.user.js)
@@ -3888,9 +3888,39 @@
     return null;
   }
 
+  // Nieprzeczytana wiadomość w „ODEBRANE” (wiersz wytłuszczony): Serum i tak
+  // zawraca na stronę startową, dopóki się jej nie przeczyta, więc auto klik
+  // kręciłby się w kółko. Wiersze odebranych mają lang="odebrane", nagłówek
+  // (tr_naglowek, też pogrubiony) go nie ma.
+  function maNieprzeczytanaWiadomosc() {
+    for (const tr of document.querySelectorAll('tr[lang="odebrane"]')) {
+      for (const el of tr.querySelectorAll('td, td *')) {
+        if (parseInt(getComputedStyle(el).fontWeight, 10) >= 600) return true;
+      }
+    }
+    return false;
+  }
+
+  // Bezpiecznik na pętlę z innego powodu: jeśli wracamy na stronę startową
+  // niecałą minutę po naszym kliku, drugi raz już nie klikamy.
+  const KLUCZ_DASHBOARD_KLIK = 'serum_dashboard_nav_klik';
+
   function modDashboardNav() {
     if (dashboardNavDone) return;
     if (!isDashboardPage()) return;
+
+    if (maNieprzeczytanaWiadomosc()) {
+      dashboardNavDone = true;
+      dbg('modDashboardNav: nieprzeczytana wiadomość w ODEBRANE — bez auto kliku „Wizyty (EDM)”');
+      return;
+    }
+    let ostatni = 0;
+    try { ostatni = Number(sessionStorage.getItem(KLUCZ_DASHBOARD_KLIK)) || 0; } catch (e) {}
+    if (Date.now() - ostatni < 60_000) {
+      dashboardNavDone = true;
+      dbg('modDashboardNav: powrót na stronę startową tuż po auto kliku — nie klikam ponownie (pętla?)');
+      return;
+    }
 
     const link = findWizytyEdmLink();
     if (!link) {
@@ -3899,6 +3929,7 @@
     }
 
     dashboardNavDone = true;
+    try { sessionStorage.setItem(KLUCZ_DASHBOARD_KLIK, String(Date.now())); } catch (e) {}
     dbg('modDashboardNav: klik „Wizyty (EDM)” po zalogowaniu');
     link.click();
   }
