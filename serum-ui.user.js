@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.114.0
+// @version      3.115.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.114.0';
+  const SCRIPT_VERSION = '3.115.0';
 
   // =====================================================================
   // MODUŁ: auto OK dialogi (dawniej serum-dialogs.user.js)
@@ -245,6 +245,104 @@
     } else {
       document.addEventListener('DOMContentLoaded', injectIntoPage, { once: true });
     }
+  })();
+
+  // =====================================================================
+  // MODUŁ: fałszywe „Dawkomat chwilowo nie odpowiada”
+  // prescriptions.js (initDawkomat) trzyma JEDEN wspólny timer 15 s
+  // (self.dawkomatTimer) dla wszystkich recept. Przy kilku receptach naraz
+  // każda nadpisuje uchwyt poprzedniej, a pierwsza wiadomość z dowolnej ramki
+  // Dawkomatu kasuje tylko ostatni timer — wcześniejsze odpalają confirm,
+  // choć ich Dawkomat dawno się załadował. „OK” przełączałoby wtedy działającą
+  // receptę na standardowe dawkowanie.
+  // Tu: zapamiętujemy, które ramki Dawkomatu już się odezwały (postMessage).
+  // Gdy wszystkie się odezwały — to fałszywy alarm, cicho „Anuluj”.
+  // Gdy któraś naprawdę milczy — przeładowujemy ją i dajemy jej jeszcze 20 s;
+  // dopiero potem pytamy jak Serum i przy „OK” przełączamy jak initDawkomat.
+  // Działa w kontekście strony (jak moduł dialogów), w oknie głównym
+  // i w ramkach z tej samej domeny.
+  // =====================================================================
+  (function serumDawkomatModule() {
+    const code = `
+      (function () {
+        var KEY = '__serumDawkomatFix';
+        function install(win) {
+          if (!win || win[KEY]) return;
+          win[KEY] = true;
+          var doc = win.document;
+          var odezwane = new WeakSet();
+          var ponowione = new WeakSet();
+          win.addEventListener('message', function (e) {
+            if (e.source) odezwane.add(e.source);
+          }, true);
+          function milczy(f) {
+            try { return !f.contentWindow || !odezwane.has(f.contentWindow); } catch (e) { return true; }
+          }
+          function naStandard(f) {
+            var row = f.closest('.x-prescriptionDrugRow');
+            if (!row) return;
+            var $ = win.$Q;
+            if ($) {
+              $('.x-dawkomatCheck', row).prop('checked', false);
+              $('.x-drugDaysPanel, .x-drugDosagePanel', row).show();
+              $('.x-drugDosageDawkomatPanel', row).hide();
+              $(row).find('.x-drugDosageDawkomat').html('');
+              $(row).find('.x-dosageDocumentDescription, .x-dosageDocumentId, .x-dosageDocument').val('');
+            }
+          }
+          var nativeConfirm = win.confirm;
+          win.confirm = function (msg) {
+            if (String(msg == null ? '' : msg).toLowerCase().indexOf('dawkomat chwilowo nie odpowiada') === -1) {
+              return nativeConfirm.apply(this, arguments);
+            }
+            var ramki = Array.prototype.slice.call(doc.querySelectorAll('iframe.dawkomat-frame')).filter(milczy);
+            if (!ramki.length) {
+              console.log('[serum-ui] Dawkomat: fałszywy alarm (wszystkie ramki odpowiedziały) — Anuluj');
+              return false;
+            }
+            var nowe = ramki.filter(function (f) { return !ponowione.has(f); });
+            if (!nowe.length) return nativeConfirm.apply(this, arguments);
+            nowe.forEach(function (f) {
+              ponowione.add(f);
+              console.log('[serum-ui] Dawkomat: ramka milczy 15 s — przeładowuję');
+              f.src = f.src;
+            });
+            var self = this;
+            win.setTimeout(function () {
+              var wciaz = nowe.filter(function (f) { return f.isConnected && milczy(f); });
+              if (!wciaz.length) return;
+              console.log('[serum-ui] Dawkomat: nadal milczy po przeładowaniu');
+              if (nativeConfirm.call(self, msg)) wciaz.forEach(naStandard);
+            }, 20000);
+            return false;
+          };
+        }
+        install(window);
+        function ramka(f) {
+          try { install(f.contentWindow); } catch (e) {}
+          f.addEventListener('load', function () { try { install(f.contentWindow); } catch (e) {} });
+        }
+        function skanuj(root) {
+          if (!root || !root.querySelectorAll) return;
+          if (root.nodeName === 'IFRAME' || root.nodeName === 'FRAME') ramka(root);
+          var n = root.querySelectorAll('iframe, frame');
+          for (var i = 0; i < n.length; i++) ramka(n[i]);
+        }
+        skanuj(document);
+        new MutationObserver(function (rs) {
+          for (var i = 0; i < rs.length; i++)
+            for (var j = 0; j < rs[i].addedNodes.length; j++) skanuj(rs[i].addedNodes[j]);
+        }).observe(document.documentElement, { childList: true, subtree: true });
+      })();
+    `;
+    function inject() {
+      const el = document.createElement('script');
+      el.textContent = code;
+      (document.documentElement || document.head || document).appendChild(el);
+      el.remove();
+    }
+    if (document.documentElement) inject();
+    else document.addEventListener('DOMContentLoaded', inject, { once: true });
   })();
 
   // =====================================================================
