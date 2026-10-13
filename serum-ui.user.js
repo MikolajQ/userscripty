@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.115.0
+// @version      3.116.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.115.0';
+  const SCRIPT_VERSION = '3.116.0';
 
   // =====================================================================
   // MODUŁ: auto OK dialogi (dawniej serum-dialogs.user.js)
@@ -1111,6 +1111,56 @@
     return null;
   }
 
+  // PIN do podpisu e-recepty/IPOM wpisywała dawniej przeglądarka (zapisane
+  // hasło), ale Serum zmieniło pole na type="text" + autocomplete="off"
+  // (kropki tylko przez CSS -webkit-text-security), więc menedżer haseł go
+  // już nie wypełnia. Trzymamy go w pamięci Tampermonkeya, jak PIN do PUE —
+  // pytamy raz, przy pierwszej potrzebie; zmiana przez menu.
+  const KLUCZ_PODPIS_PIN = 'serum_podpis_pin';
+  let podpisPinPytano = false;
+
+  function zapytajOPodpisPin() {
+    const wpisany = window.prompt('PIN do podpisu e-recept/IPOM (Serum) — zostanie zapamiętany w Tampermonkey:', '');
+    if (wpisany == null) return '';
+    const kod = wpisany.trim();
+    if (!/^\d{4,}$/.test(kod)) {
+      window.alert('PIN musi składać się z cyfr — nie zapisano.');
+      return '';
+    }
+    GM_setValue(KLUCZ_PODPIS_PIN, kod);
+    return kod;
+  }
+
+  function podpisPin() {
+    const kod = GM_getValue(KLUCZ_PODPIS_PIN, '');
+    if (kod) return kod;
+    if (podpisPinPytano) return '';
+    podpisPinPytano = true;
+    return zapytajOPodpisPin();
+  }
+
+  GM_registerMenuCommand?.('Ustaw PIN do podpisu e-recept (Serum)', () => {
+    if (zapytajOPodpisPin()) window.alert('Zapisano PIN do podpisu e-recept.');
+  });
+
+  // Wpisuje PIN raz na pojawienie się pola (WeakSet) i tylko do pustego —
+  // jeśli ktoś go skasuje/poprawi ręcznie, nie nadpisujemy.
+  const wypelnionePolaPin = new WeakSet();
+  function wpiszPodpisPin(pin, modul) {
+    if (wypelnionePolaPin.has(pin)) return;
+    wypelnionePolaPin.add(pin);
+    if (pin.value.trim()) return;
+    const kod = podpisPin();
+    if (!kod) {
+      dbg(modul + ': brak zapisanego PIN-u do podpisu — wpisz ręcznie lub ustaw w menu');
+      return;
+    }
+    pin.value = kod;
+    pin.dispatchEvent(new Event('input', { bubbles: true }));
+    pin.dispatchEvent(new Event('change', { bubbles: true }));
+    dbg(modul + ': wpisano zapamiętany PIN');
+  }
+
   function modPodpiszERecepte() {
     const pin = document.getElementById('eReceptaPin');
     if (!isOverlayElementVisible(pin)) {
@@ -1118,7 +1168,8 @@
       return;
     }
     if (ereceptSigned) return;
-    if (!/^\d{4}$/.test(pin.value.trim())) return;
+    wpiszPodpisPin(pin, 'modPodpiszERecepte');
+    if (!/^\d{4,}$/.test(pin.value.trim())) return;
 
     const signBtn = findEreceptSignButton(pin);
     if (!signBtn || signBtn.disabled) return;
@@ -1151,6 +1202,7 @@
       ipomBrakPinuZalogowany = true;
       return;
     }
+    wpiszPodpisPin(pin, 'modPodpiszIpom');
     if (!/^\d{4,}$/.test(pin.value.trim())) return;
 
     const signBtn = [...popup.querySelectorAll('button.x-buttonSign')].find(
