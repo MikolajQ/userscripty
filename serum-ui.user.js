@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.116.0
+// @version      3.117.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.116.0';
+  const SCRIPT_VERSION = '3.117.0';
 
   // =====================================================================
   // MODUŁ: auto OK dialogi (dawniej serum-dialogs.user.js)
@@ -1222,6 +1222,11 @@
   // zmiana przez menu „Ustaw PIN do PUE ZUS (Serum)”.
   const KLUCZ_PUE_PIN = 'serum_pue_pin';
   let puePinPytano = false;
+  // Ustawiane, gdy serwer odrzuci logowanie (odpowiedź inna niż „OK”). Przy
+  // złym PIN-ie każde kolejne okno byłoby kolejną nieudaną próbą — prosta
+  // droga do blokady konta w PUE. Zdejmuje to zapisanie PIN-u z menu albo
+  // przeładowanie strony.
+  let pueAutoPinWstrzymany = false;
 
   function zapytajOPuePin() {
     const wpisany = window.prompt('PIN do PUE ZUS (Serum) — zostanie zapamiętany w Tampermonkey:', '');
@@ -1232,6 +1237,7 @@
       return '';
     }
     GM_setValue(KLUCZ_PUE_PIN, kod);
+    pueAutoPinWstrzymany = false;
     return kod;
   }
 
@@ -1247,104 +1253,200 @@
     if (zapytajOPuePin()) window.alert('Zapisano PIN do PUE ZUS.');
   });
 
-  // Zbyt szybkie zatwierdzenie PIN-u (tuż po pojawieniu się okienka) trafiało
-  // czasem w moment, zanim strona zdążyła zainicjalizować sesję logowania do
-  // PUE po swojej stronie. 500ms nie wystarczało, 2000ms już tak — ale skoro
-  // nawet dłuższe opóźnienia (patrz niżej) nie dają twardej gwarancji, a
-  // automatyczne powtarzanie i tak łata pojedyncze niepowodzenia, trzymamy
-  // to umiarkowanie, nie maksymalnie ostrożnie.
+  // --- EZLA: PIN i „Pobierz dane z ZUS” sterowane odpowiedziami serwera ---
   //
-  // Opóźnienie ADAPTACYJNE (od 3.96.0). Logi z 08–09.09.2026: 3 logowania,
-  // każde domknięte 0,4 s po wysłaniu PIN-u, zero „Błąd sesji” — czyli z
-  // ~1,4 s od pojawienia się okna do zalogowania aż 1,0 s to była nasza własna
-  // pauza. Startujemy więc niżej; jeśli „Błąd sesji” się jednak pojawi,
-  // pauza rośnie o PUE_SUBMIT_DELAY_STEP_MS (do pułapu) i tak zostaje do
-  // przeładowania strony. Sam „Błąd sesji” jest i tak zamykany automatycznie,
-  // a pobranie danych ponawiane — więc koszt zbyt krótkiej pauzy to jedna
-  // dodatkowa runda, nie utknięcie.
-  const PUE_SUBMIT_DELAY_START_MS = 600;
-  const PUE_SUBMIT_DELAY_STEP_MS = 400;
-  const PUE_SUBMIT_DELAY_MAX_MS = 2000;
-  let pueSubmitDelayMs = PUE_SUBMIT_DELAY_START_MS;
+  // Kod Serum (funkcje strony zrzucone z konsoli 19.10.2026) rozstrzyga to,
+  // co do 3.116.0 było wnioskowane z czasów w logu:
+  //   fr_ezla_form(…, 'B')       → f_ezla_sprawdz_sesje('T')   [ap_zla.sprawdz_sesje]
+  //   fr_ezla_sprawdz_sesje       → „OK”: Serum SAMO woła f_elza_pobierz_dane_z_zus(),
+  //                                 inaczej f_ezla_zaloguj() → okno PIN
+  //   f_ezla_zaloguj(txt)         → [ap_zla.zalogujzus_html] → okno PIN, o ile pola
+  //                                 PIN nie ma w DOM (sprawdzane przed i po żądaniu)
+  //   f_ezla_zaloguj2()           → uf_schowaj_div() — okno PIN znika OD RAZU, przed
+  //                                 odpowiedzią — i dopiero [ap_zla.zalogujzus]
+  //   fr_ezla_zaloguj2('OK')      → nic (wywołanie f_ezla_sprawdz_sesje zakomentowane)
+  //   f_elza_pobierz_dane_z_zus() → 3–4 RÓWNOLEGŁE [ap_zla_zus.*]; każda odpowiedź
+  //                                 „BLAD_SESJI” woła f_ezla_zaloguj('Błąd sesji')
+  // Żądań ap_zla.* nie przejmuje serum2 (ser.handleSerum1AjaxRequest), więc
+  // to zwykły XHR POST z uf_ajax — stąd podsłuch na XMLHttpRequest poniżej.
+  //
+  // Wnioski:
+  //  1. Po zalogowaniu NIKT nie pobiera danych — robi to skrypt, od razu po
+  //     odpowiedzi „OK” na ap_zla.zalogujzus. Dotąd czekał 8 s na „samodzielne
+  //     dokończenie” przez Serum, którego nie ma; a liczył od zniknięcia okna
+  //     PIN, które wcale nie oznacza zalogowania (uf_schowaj_div). Za wczesne
+  //     ponowienie (28.09, 10:42) trafiało przed odpowiedź logowania →
+  //     BLAD_SESJI → kolejne okno PIN.
+  //  2. Przy otwarciu formularza z aktywną sesją Serum pobiera dane samo —
+  //     własne wywołanie skryptu było dublem równoległych zapytań do ZUS,
+  //     a przy wygasłej sesji mnożyło odpowiedzi BLAD_SESJI.
+  //  3. Każde zapytanie eZLA w toku może jeszcze otworzyć NOWE okno PIN: po
+  //     wysłaniu PIN-u pole znika, więc strażnik w f_ezla_zaloguj przepuszcza.
+  //     PIN idzie więc, gdy nic z eZLA nie wisi — zamiast stałej pauzy
+  //     (600 ms), która łapała to tylko statystycznie.
+  //  4. Dane dotarły = odpowiedź pobierzDaneUbezpieczonego z KodBledu 0
+  //     (tak samo sprawdza f_ezla_spr_odp), bez porównywania pól co tick.
 
-  function wydluzPauzePrzedPinem(powod) {
-    if (pueSubmitDelayMs >= PUE_SUBMIT_DELAY_MAX_MS) return;
-    pueSubmitDelayMs = Math.min(PUE_SUBMIT_DELAY_MAX_MS, pueSubmitDelayMs + PUE_SUBMIT_DELAY_STEP_MS);
-    dbg('modPueLogowanie: ' + powod + ' — wydłużam pauzę przed PIN-em do ' + pueSubmitDelayMs + 'ms');
-  }
-
-  // Okno PIN pojawia się po odpowiedzi serwera, czyli jako zwykła mutacja
-  // DOM — a te idą przez debounce 400 ms wspólnego obserwatora. Dla tego
-  // jednego okna warto ominąć debounce: wspólny obserwator woła tę funkcję
-  // przy każdej istotnej mutacji (koszt: jedno getElementById), a gdy pole
-  // PIN pojawi się PO RAZ PIERWSZY, tick idzie natychmiast. Element jest
-  // zapamiętywany, więc kolejne mutacje przy już otwartym oknie nic nie robią.
-  let pueSzybkoZauwazonyPin = null;
-  function pojawilSiePinPue() {
-    const pin = document.getElementById('inp_ezla_logowanie_pin');
-    if (!pin || pin === pueSzybkoZauwazonyPin) return false;
-    pueSzybkoZauwazonyPin = pin;
-    return true;
-  }
-  // Po (pozornie udanym) zalogowaniu sesja PUE potrzebuje chwili, zanim
-  // zniesie zapytanie o dane z ZUS — zbyt szybkie „Pobierz dane z ZUS” (nawet
-  // ~400ms po zalogowaniu) potrafiło samo wywołać kolejne okienko logowania.
-  // W praktyce nawet 2500ms nie zawsze temu zapobiegało (to raczej zwykła
-  // niestabilność po stronie PUE/ZUS niż twardy próg czasowy), więc nie ma
-  // sensu trzymać tu dużej wartości — automatyczne powtarzanie i tak dogra
-  // ewentualną drugą rundę logowania. To opóźnienie obowiązuje KAŻDĄ próbę
-  // (pierwszą i powtórki), stąd osobna, wspólna zmienna zamiast liczenia tego
-  // przy każdym resecie ezlaPobierzDone z osobna.
-  const PUE_SESSION_SETTLE_MS = 1200;
-  let pueSessionSettleUntil = 0;
-  function markPueSessionSettling() {
-    pueSessionSettleUntil = Date.now() + PUE_SESSION_SETTLE_MS;
-  }
-  let pueLoginDone = false;
-  let puePendingTimer = null;
-
-  // --- diagnostyka zacięć eZLA (ZUS bywa przeciążony) ---
-  // Cały ten przepływ jest „jednostrzałowy”: PIN wysyłamy raz na pojawienie
-  // się okienka, „Pobierz dane z ZUS” klikamy raz — i NIGDZIE nie sprawdzamy,
-  // czy operacja się faktycznie udała. Gdy ZUS odpowiada wolno albo wcale,
-  // nic tego nie ponawia i wszystko staje. Te wpisy mają pokazać, na którym
-  // dokładnie kroku się zacina i co wtedy widnieje w oknie — żeby naprawiać
-  // na podstawie faktów, a nie domysłów.
-  const PUE_STUCK_LOG_MS = 6000;
-  let pueSubmitAt = 0;
-  let pueStuckLogged = false;
-  let pueBrakKrzyzykaLogged = false;
-
-  function describeEl(el) {
-    if (!el) return '(brak)';
-    const cls = el.className && typeof el.className === 'string' ? '.' + el.className.trim().replace(/\s+/g, '.') : '';
-    const attrs = [];
-    if (el.disabled) attrs.push('disabled');
-    if (el.getAttribute?.('aria-disabled')) attrs.push('aria-disabled=' + el.getAttribute('aria-disabled'));
-    const href = el.getAttribute?.('href');
-    if (href) attrs.push('href=' + href.slice(0, 60));
-    const onclick = el.getAttribute?.('onclick');
-    if (onclick) attrs.push('onclick=' + onclick.slice(0, 60));
-    return el.tagName.toLowerCase() + cls + (attrs.length ? ' [' + attrs.join(' ') + ']' : '');
-  }
-
-  function findPueDialogRoot(pin) {
-    let el = pin.parentElement;
-    for (let depth = 0; depth < 12 && el; depth++) {
-      if (normLabel(el.textContent).toLowerCase().includes('logowanie do pue')) return el;
-      el = el.parentElement;
+  function podsluchEzlaXhr() {
+    if (window.__serumEzlaXhr) return;
+    window.__serumEzlaXhr = true;
+    var proto = XMLHttpRequest.prototype;
+    var open = proto.open;
+    var send = proto.send;
+    var RE = /(?:^|\/)(ap_zla(?:_zus)?\.\w+)/;
+    function emit(d) {
+      try {
+        document.dispatchEvent(new CustomEvent('serum-ezla-xhr', { detail: JSON.stringify(d) }));
+      } catch (e) {}
     }
-    return null;
+    proto.open = function (method, url) {
+      var m = RE.exec(String(url));
+      this.__serumEzla = m ? m[1] : null;
+      return open.apply(this, arguments);
+    };
+    proto.send = function () {
+      var proc = this.__serumEzla;
+      if (proc) {
+        var xhr = this;
+        var t0 = Date.now();
+        emit({ faza: 'start', proc: proc });
+        // loadend przychodzi po readystatechange, czyli już po callbacku Serum
+        // (eval w uf_ajax) — okno PIN z fr_ezla_zaloguj jest wtedy w DOM.
+        xhr.addEventListener('loadend', function () {
+          var txt = '';
+          var wynik;
+          try { txt = xhr.responseText || ''; } catch (e) {}
+          if (xhr.status !== 200) wynik = 'HTTP ' + xhr.status;
+          else if (txt === 'OK' || txt === 'BLAD_SESJI') wynik = txt;
+          else {
+            var k = /<(?:\w+:)?KodBledu>\s*(-?\d+)/.exec(txt);
+            wynik = k ? 'KodBledu ' + k[1] : 'inna odpowiedź';
+          }
+          emit({
+            faza: 'koniec',
+            proc: proc,
+            ms: Date.now() - t0,
+            wynik: wynik,
+            tekst: proc === 'ap_zla.zalogujzus' && wynik !== 'OK' ? txt.slice(0, 160) : '',
+          });
+        });
+      }
+      return send.apply(this, arguments);
+    };
   }
 
+  (function wstrzyknijPodsluchEzla() {
+    function inject() {
+      const el = document.createElement('script');
+      el.textContent = '(' + podsluchEzlaXhr + ')();';
+      (document.documentElement || document.head || document).appendChild(el);
+      el.remove();
+    }
+    if (document.documentElement) inject();
+    else document.addEventListener('DOMContentLoaded', inject, { once: true });
+  })();
+
+  // Gdyby po zalogowaniu kolejne zapytania wciąż dostawały BLAD_SESJI, skrypt
+  // nie kręci pętli PIN-ów: po tylu logowaniach z rzędu bez udanego pobrania
+  // danych z ZUS okno PIN zostaje dla użytkownika.
+  const PUE_LOGINY_Z_RZEDU_MAX = 2;
+  // Górna granica czekania z PIN-em na zapytania eZLA w toku. Zwykła runda
+  // BLAD_SESJI → okno PIN trwa ~0,3 s (log 28.09, 10:42); dłużej wiszą tylko
+  // zapytania, na które ZUS nie odpowiada (16–19 s, logi 22.09 i 28.09) —
+  // wtedy czekanie kosztuje więcej niż ewentualne drugie logowanie.
+  const PUE_PIN_CZEKAJ_MAX_MS = 2000;
+
+  const ezlaWToku = new Map(); // procedura → liczba żądań w toku
+  let ezlaPodsluchDziala = false;
+  let ezlaPodsluchMilczyLogged = false;
+  let ezlaOknoPinLogged = null;
+  let ezlaDaneZZus = false; // pobierzDaneUbezpieczonego z KodBledu 0 w bieżącym formularzu
+  let ezlaPobierzPoZalogowaniu = false;
+  let pueZalogowanoAt = 0;
+  let pueLoginyZRzedu = 0;
+  let puePinWyslanyDo = null; // jedna próba na jedno okno PIN
+  let pueCzekaPole = null;
+  let pueCzekaOd = 0;
+  let pueCzekaTimer = null;
+  let pueLimitLogged = null;
+
+  function ezlaWTokuOpis() {
+    let opis = '';
+    for (const [proc, n] of ezlaWToku) {
+      if (n > 0) opis += (opis ? ', ' : '') + proc + (n > 1 ? ' ×' + n : '');
+    }
+    return opis;
+  }
+
+  function ezlaPoOdpowiedzi(d) {
+    const czas = ' (' + d.ms + ' ms)';
+    switch (d.proc) {
+      case 'ap_zla.form2':
+        ezlaDaneZZus = false;
+        ezlaPobierzPoZalogowaniu = false;
+        pueLoginyZRzedu = 0;
+        return;
+      case 'ap_zla.sprawdz_sesje':
+        dbg('eZLA: sesja PUE ' + (d.wynik === 'OK' ? 'aktywna — Serum samo pobiera dane z ZUS' : 'nieaktywna (' + d.wynik + ')') + czas);
+        return;
+      case 'ap_zla.zalogujzus_html': {
+        const pin = document.getElementById('inp_ezla_logowanie_pin');
+        if (pin) {
+          // Kolejne odpowiedzi przy już otwartym oknie Serum pomija (strażnik
+          // w fr_ezla_zaloguj) — w logu wystarczy pierwsza.
+          if (pin !== ezlaOknoPinLogged) dbg('eZLA: okno PIN' + czas);
+          ezlaOknoPinLogged = pin;
+          return;
+        }
+        // Wg kodu Serum ta odpowiedź to zawsze okno PIN — jeśli go nie ma,
+        // trzeba zobaczyć, co się pokazało zamiast niego.
+        const okna = [...document.querySelectorAll('.przegladarka')].filter(isOverlayElementVisible);
+        dbg('eZLA: po ap_zla.zalogujzus_html brak pola PIN — na wierzchu: „' +
+          normLabel(okna[okna.length - 1]?.textContent).slice(0, 120) + '”' + czas);
+        return;
+      }
+      case 'ap_zla.zalogujzus':
+        if (d.wynik === 'OK') {
+          pueZalogowanoAt = Date.now();
+          ezlaPobierzPoZalogowaniu = true;
+          dbg('eZLA: zalogowano do PUE' + czas);
+        } else {
+          pueAutoPinWstrzymany = true;
+          dbg('eZLA: logowanie odrzucone — ' + d.wynik + ' „' + d.tekst + '”' + czas +
+            '; auto-PIN wstrzymany do zapisania PIN-u z menu albo przeładowania strony');
+        }
+        return;
+      case 'ap_zla_zus.pobierzDaneUbezpieczonego':
+        if (d.wynik === 'KodBledu 0') {
+          ezlaDaneZZus = true;
+          pueLoginyZRzedu = 0;
+        }
+        dbg('eZLA: dane ubezpieczonego z ZUS — ' + d.wynik + czas);
+        return;
+    }
+  }
+
+  document.addEventListener('serum-ezla-xhr', (e) => {
+    let d;
+    try { d = JSON.parse(e.detail); } catch (_) { return; }
+    ezlaPodsluchDziala = true;
+    const n = ezlaWToku.get(d.proc) || 0;
+    if (d.faza === 'start') {
+      ezlaWToku.set(d.proc, n + 1);
+      return;
+    }
+    ezlaWToku.set(d.proc, Math.max(0, n - 1));
+    ezlaPoOdpowiedzi(d);
+    // Poza zdarzeniem XHR — callback Serum ma się zakończyć, zanim ruszymy DOM.
+    setTimeout(modEzlaPue, 0);
+  });
+
+  // Krzyżyk okna Serum — używany też przez modProceduryDodatkowe (słownik).
   function findPueCloseButton(root) {
     // Najpewniejszy sygnał — natywne klasy Serum dla krzyżyka. Dotąd ta
     // funkcja szukała WYŁĄCZNIE po tekście „×” (U+00D7) lub litery „x”, przez
     // co nie widziała ani wariantu „✕” (U+2715), ani krzyżyka rysowanego tłem
-    // CSS (button.popup-close — element bez żadnego tekstu). Wtedy okno „Błąd
-    // sesji” zostawało otwarte aż do ręcznego zamknięcia. Moduł WYNIKI
-    // OPERACJI w tym samym pliku ma to rozwiązane od dawna — tu było
-    // przeoczone.
+    // CSS (button.popup-close — element bez żadnego tekstu).
     const byClass = root.querySelector(
       'button.popup-close, a.popup-close, button.x-buttonClose, a.x-buttonClose, div.div_close'
     );
@@ -1361,122 +1463,7 @@
     return null;
   }
 
-  // Fałszywy „Błąd sesji” potrafi mignąć na ekranie tuż po zalogowaniu — jeśli
-  // czekalibyśmy na zwykły, zdebounce'owany (400ms) cykl uiTick(), użytkownik
-  // zdążyłby go zobaczyć. Dedykowany, chwilowy MutationObserver reaguje od
-  // razu na pojawienie się okna i zamyka je praktycznie niezauważalnie.
-  let pueErrorObserver = null;
-
-  function stopWatchingPueSessionError() {
-    pueErrorObserver?.disconnect();
-    pueErrorObserver = null;
-  }
-
-  function tryCloseImmediatePueSessionError() {
-    const pin = document.getElementById('inp_ezla_logowanie_pin');
-    if (!isOverlayElementVisible(pin)) return false;
-    const root = findPueDialogRoot(pin);
-    if (!root || !/błąd sesji/i.test(root.textContent || '')) return false;
-    const closeBtn = findPueCloseButton(root);
-    if (!closeBtn) return false;
-    dbg('modPueLogowanie: (szybka ścieżka) wykryto "Błąd sesji" — zamykam natychmiast');
-    wydluzPauzePrzedPinem('„Błąd sesji” po zalogowaniu');
-    closeBtn.click();
-    markPueSessionSettling();
-    armEzlaPobierzRetry();
-    return true;
-  }
-
-  function watchForPueSessionError() {
-    if (pueErrorObserver) return;
-    pueErrorObserver = new MutationObserver(() => {
-      if (tryCloseImmediatePueSessionError()) stopWatchingPueSessionError();
-    });
-    pueErrorObserver.observe(document.body, { childList: true, subtree: true });
-    // Okno błędu pojawia się (jeśli w ogóle) w ciągu ok. sekundy od
-    // zalogowania — po tym czasie obserwator nie jest już potrzebny.
-    setTimeout(stopWatchingPueSessionError, 3000);
-  }
-
-  // Log 22.09.2026 (12:02, 12:23): "Błąd sesji" wyskakiwało u lekarza WIELE
-  // razy, a w logu skryptu — zero śladu. Przyczyna: oba dotychczasowe
-  // detektory (tryCloseImmediatePueSessionError, modPueLogowanie) wymagają
-  // WIDOCZNEGO pola PIN logowania jako punktu zaczepienia (findPueDialogRoot
-  // wychodzi od niego w górę drzewa). Tego dnia okno „Błąd sesji” wyskakiwało
-  // SAMODZIELNIE — bez żadnego pola PIN w DOM — jako efekt naszego ślepego
-  // ponowienia „Pobierz dane z ZUS” (patrz EZLA_POBIERZ_MAX_PROB), gdy
-  // poprzednie żądanie do ZUS jeszcze nie wróciło (sesja PUE wygasła i
-  // odpowiedź na pierwsze kliknięcie przyszła dopiero po ~16-19s — znacznie
-  // dłużej niż nasz odstęp ponowienia). Ten moduł łapie „Błąd sesji" GDZIEKOLWIEK
-  // się pojawi, niezależnie od pola PIN — szuka nagłówka z dokładnym tekstem
-  // i generycznego przycisku zamknięcia w jego przodkach.
-  let bladSesjiBrakKrzyzykaLogged = false;
-  // Log 28.09.2026: od pierwszego logowania do PUE tekst „Błąd sesji” siedzi
-  // w DOM na stałe (ukryty szablon okna), więc bramka tekstowa przepuszczała
-  // KAŻDY tick, a skan wszystkich div/span z normLabel(textContent) każdego z
-  // nich kosztował do 30 ms (najczęstszy winowajca DŁUGICH TICKÓW). Teraz:
-  // przejście tylko po węzłach TEKSTOWYCH, a ich listę budujemy od nowa tylko
-  // gdy zmienił się tekst strony (domWersja). Widoczność sprawdzamy KAŻDY
-  // tick — Serum pokazuje ukryte okno zmianą style/class, a zmiany atrybutów
-  // nie podbijają domWersja.
-  let bladSesjiKandydaciWersja = -1;
-  let bladSesjiKandydaci = [];
-
-  function findBladSesjiRoot() {
-    if (bladSesjiKandydaciWersja !== domWersja) {
-      bladSesjiKandydaciWersja = domWersja;
-      bladSesjiKandydaci = [];
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-      for (let t = walker.nextNode(); t; t = walker.nextNode()) {
-        const v = t.nodeValue;
-        if (v && v.length < 200 && /błąd sesji/i.test(v) && t.parentElement) bladSesjiKandydaci.push(t.parentElement);
-      }
-    }
-    for (const node of bladSesjiKandydaci) {
-      if (!isOverlayElementVisible(node)) continue;
-      let root = node.parentElement;
-      for (let depth = 0; depth < 12 && root && root !== document.body; depth++) {
-        if (findPueCloseButton(root)) return root;
-        root = root.parentElement;
-      }
-      return node; // widoczny, ale bez krzyżyka — zgłosimy to w logu
-    }
-    return null;
-  }
-
-  function modBladSesjiZus() {
-    // Bramka na surowym tekście — tanio odsiewa każdy tick bez tego okna.
-    if (!getBodyTextLower().includes('błąd sesji')) {
-      bladSesjiBrakKrzyzykaLogged = false;
-      return;
-    }
-    // Pole PIN widoczne → tym oknem zajmuje się modPueLogowanie (i jego
-    // szybki obserwator) — nie dublujemy obsługi.
-    const pin = document.getElementById('inp_ezla_logowanie_pin');
-    if (isOverlayElementVisible(pin)) return;
-
-    const root = findBladSesjiRoot();
-    if (!root) return;
-    const closeBtn = findPueCloseButton(root);
-    if (!closeBtn) {
-      if (!bladSesjiBrakKrzyzykaLogged) {
-        bladSesjiBrakKrzyzykaLogged = true;
-        dbg('modBladSesjiZus: samodzielne okno "Błąd sesji" (bez pola PIN) — nie znalazłem krzyżyka, root=' + describeEl(root));
-      }
-      return;
-    }
-    dbg('modBladSesjiZus: samodzielne okno "Błąd sesji" (bez pola PIN) — zamykam, root=' + describeEl(root));
-    closeBtn.click();
-    markPueSessionSettling();
-    armEzlaPobierzRetry();
-  }
-
-  function submitPueLogin(pin) {
-    const kod = puePin();
-    if (!kod) {
-      dbg('submitPueLogin: brak zapisanego PIN-u do PUE — wpisz ręcznie lub ustaw w menu');
-      return;
-    }
+  function submitPueLogin(pin, kod) {
     pin.value = kod;
     pin.dispatchEvent(new Event('input', { bubbles: true }));
     pin.dispatchEvent(new Event('change', { bubbles: true }));
@@ -1491,10 +1478,10 @@
     if (typeof uw.f_ezla_zaloguj2 === 'function') {
       try {
         uw.f_ezla_zaloguj2();
-        dbg('modPueLogowanie: PIN wpisany, zalogowano przez f_ezla_zaloguj2()');
+        dbg('eZLA: PIN wpisany, f_ezla_zaloguj2()');
         return;
       } catch (e) {
-        dbg('modPueLogowanie: błąd f_ezla_zaloguj2(): ' + e);
+        dbg('eZLA: błąd f_ezla_zaloguj2(): ' + e);
       }
     }
 
@@ -1504,436 +1491,90 @@
         (el) => isOverlayElementVisible(el) && normLabel(el.textContent || el.value) === 'Zaloguj'
       );
       if (btn) {
-        dbg('modPueLogowanie: PIN wpisany, klik Zaloguj');
+        dbg('eZLA: PIN wpisany, klik Zaloguj');
         btn.click();
         return;
       }
       panel = panel.parentElement;
     }
-    dbg('modPueLogowanie: PIN wpisany, ale nie znaleziono sposobu zalogowania');
+    dbg('eZLA: PIN wpisany, ale nie znaleziono sposobu zalogowania');
   }
 
-  function modPueLogowanie() {
+  function pueSprobujPin() {
     const pin = document.getElementById('inp_ezla_logowanie_pin');
-    if (!isOverlayElementVisible(pin)) {
-      // Okno PIN zniknęło — czyli logowanie się domknęło. Czas do zniknięcia
-      // pokazuje, jak długo trwała odpowiedź PUE/ZUS przy tej próbie.
-      if (pueSubmitAt) {
-        dbg('modPueLogowanie: okno PIN zamknięte ' + ((Date.now() - pueSubmitAt) / 1000).toFixed(1) + 's po wysłaniu PIN-u');
-        pueSubmitAt = 0;
-      }
-      pueLoginDone = false;
-      if (puePendingTimer) {
-        clearTimeout(puePendingTimer);
-        puePendingTimer = null;
-      }
-      return;
+    if (!pin || pin === puePinWyslanyDo || pueAutoPinWstrzymany || !isOverlayElementVisible(pin)) return;
+
+    if (!ezlaPodsluchDziala && !ezlaPodsluchMilczyLogged) {
+      ezlaPodsluchMilczyLogged = true;
+      dbg('eZLA: okno PIN, a podsłuch XHR nie zgłosił żadnego żądania — po zalogowaniu dane z ZUS trzeba będzie pobrać ręcznie');
     }
 
-    // Po zalogowaniu potrafi się pojawić fałszywy "Błąd sesji" — mimo niego
-    // sesja PUE i tak jest już aktywna, więc wystarczy zamknąć to okno, bez
-    // ponawiania logowania (ryzyko blokady przy powtarzanych próbach PIN-u).
-    const root = findPueDialogRoot(pin);
-    if (root && /błąd sesji/i.test(root.textContent || '')) {
-      const closeBtn = findPueCloseButton(root);
-      if (!closeBtn) {
-        // Bez tego wpisu brak krzyżyka był całkowicie niewidoczny w logu —
-        // okno „Błąd sesji” po prostu wisiało i wyglądało to jak zacięcie.
-        if (!pueBrakKrzyzykaLogged) {
-          pueBrakKrzyzykaLogged = true;
-          dbg('modPueLogowanie: wykryto "Błąd sesji", ale NIE ZNALAZŁEM krzyżyka do zamknięcia — okno zostanie otwarte');
-        }
-      } else {
-        dbg('modPueLogowanie: wykryto "Błąd sesji" — zamykam okno (sesja już aktywna)');
-        wydluzPauzePrzedPinem('„Błąd sesji” po zalogowaniu');
-        closeBtn.click();
-        // Sesja PUE jest już aktywna, ale samo "Pobierz dane z ZUS" zdążyło
-        // się kliknąć PRZED zalogowaniem (więc nic wtedy nie pobrało) —
-        // pozwalamy modEzlaPobierzZus spróbować ponownie, ale dopiero jeśli
-        // dane faktycznie nie dotarły (patrz armEzlaPobierzRetry).
-        markPueSessionSettling();
-        armEzlaPobierzRetry();
+    if (pueLoginyZRzedu >= PUE_LOGINY_Z_RZEDU_MAX) {
+      if (pueLimitLogged !== pin) {
+        pueLimitLogged = pin;
+        dbg('eZLA: ' + pueLoginyZRzedu + ' logowania z rzędu bez danych z ZUS — PIN zostawiam do wpisania ręcznie');
       }
       return;
     }
 
-    // DIAGNOSTYKA: PIN poszedł, a okno wciąż wisi — to właśnie moment, w
-    // którym całość „się zacina”. Logujemy raz na próbę treść okna, żeby
-    // zobaczyć, czy PUE pokazuje jakiś komunikat (błąd/oczekiwanie), czy nic.
-    if (pueLoginDone && !puePendingTimer && pueSubmitAt && !pueStuckLogged &&
-        Date.now() - pueSubmitAt > PUE_STUCK_LOG_MS) {
-      pueStuckLogged = true;
-      dbg(
-        'modPueLogowanie: ZACIĘCIE — okno PIN wciąż otwarte ' +
-          ((Date.now() - pueSubmitAt) / 1000).toFixed(1) + 's po wysłaniu PIN-u' +
-          ' | PIN wypełniony=' + ((pin.value || '').length > 0) +
-          ' | treść okna="' + normLabel(root?.textContent || '').slice(0, 200) + '"'
-      );
-    }
-
-    // Jedna próba na jedno pojawienie się okienka — przy błędnym PIN-ie nie
-    // wolno ponawiać w pętli (ryzyko blokady konta w PUE).
-    if (pueLoginDone || puePendingTimer) return;
-    pueLoginDone = true;
-
-    odnotujOknoPinPoNaszymPonowieniu();
-    const dupCount = document.querySelectorAll('[id="inp_ezla_logowanie_pin"]').length;
-    dbg(
-      'modPueLogowanie: okienko logowania wykryte (pól PIN w DOM: ' +
-        dupCount +
-        '), startuję timer ' +
-        pueSubmitDelayMs +
-        'ms'
-    );
-
-    // Małe opóźnienie przed wysłaniem PIN-u — natychmiastowe zatwierdzenie
-    // zaraz po pojawieniu się okienka bywało zbyt szybkie względem
-    // inicjalizacji sesji PUE po stronie serwera i kończyło się właśnie tym
-    // fałszywym „Błąd sesji”.
-    puePendingTimer = setTimeout(() => {
-      puePendingTimer = null;
-      if (!isOverlayElementVisible(pin)) {
-        dbg('modPueLogowanie: timer odpalił, ale okno już zniknęło — pomijam');
+    const wToku = ezlaWTokuOpis();
+    if (wToku) {
+      if (pueCzekaPole !== pin) {
+        pueCzekaPole = pin;
+        pueCzekaOd = Date.now();
+      }
+      const zostalo = pueCzekaOd + PUE_PIN_CZEKAJ_MAX_MS - Date.now();
+      if (zostalo > 0) {
+        // Koniec każdego z tych żądań i tak wywoła nas ponownie — timer to
+        // tylko górna granica czekania.
+        clearTimeout(pueCzekaTimer);
+        pueCzekaTimer = setTimeout(modEzlaPue, zostalo + 10);
         return;
       }
-      dbg('modPueLogowanie: timer odpalił, wysyłam PIN');
-      pueSubmitAt = Date.now();
-      pueStuckLogged = false;
-      submitPueLogin(pin);
-      watchForPueSessionError();
-      // Po zalogowaniu Serum samo dokańcza pobranie, które wymusiło logowanie.
-      // NIE klikamy więc „Pobierz dane z ZUS” ponownie od razu — to właśnie
-      // ten drugi klik generował kolejną prośbę o PIN (dowód w logu, patrz
-      // komentarz przy armEzlaPobierzRetry). Ponowienie nastąpi tylko wtedy,
-      // gdy po ezlaPobierzRetryMs dane wciąż nie dotrą.
-      markPueSessionSettling();
-      armEzlaPobierzRetry();
-    }, pueSubmitDelayMs);
-  }
-
-  // --- EZLA: auto-klik „Pobierz dane z ZUS” po otwarciu okna ---
-
-  let ezlaPobierzDone = false;
-
-  const EZLA_POBIERZ_LABEL = 'Pobierz dane z ZUS';
-
-  // Ponawianie pobrania danych z ZUS. Dotąd był to strzał JEDNORAZOWY: skrypt
-  // klikał „Pobierz dane z ZUS”, od razu oznaczał krok jako wykonany i nigdy
-  // nie sprawdzał, czy cokolwiek przyszło. Gdy ZUS był przeciążony (albo gdy
-  // kliknięcie trafiło w przycisk jeszcze nieaktywny — nad panelem wisiało
-  // okienko PIN), pobranie po prostu nie dochodziło do skutku i nic go już nie
-  // powtarzało. Ponawiamy więc, ale ze SZTYWNYM limitem prób — w najgorszym
-  // razie to kilka nieszkodliwych zapytań o dane, a nie pętla.
-  // (PIN-u NIE ponawiamy — tam ryzykiem jest blokada konta w PUE.)
-  // 22.09.2026: 3 → 2. Log tego dnia (12:02, 12:23): za KAŻDYM razem, gdy
-  // doszło do próby 3/3, żadna z trzech nie przyniosła danych — dane
-  // przychodziły dopiero po naturalnym (niewywołanym przez nas) pojawieniu
-  // się okna logowania PUE 16-19s później, plus JEDNO dodatkowe ponowienie
-  // PO nim. Trzecie, ślepe kliknięcie nie miało w praktyce szans na sukces,
-  // a strzelanie nim w sesję, która akurat cicho odświeża się po stronie ZUS,
-  // to najbardziej prawdopodobna przyczyna wielokrotnych okien „Błąd sesji”
-  // (patrz modBladSesjiZus) — było ich widać na ekranie, mimo że nasz log nie
-  // pokazywał żadnego z nich, bo oba detektory wymagały wtedy pola PIN.
-  const EZLA_POBIERZ_MAX_PROB = 2;
-  // Odstęp przed ponowieniem — ADAPTACYJNY (od 3.99.0). Sztywne 3500 ms
-  // było marginesem na to, że Serum samo dokończy pobranie po zalogowaniu;
-  // za wczesne ponowienie (log 18.08: ~1 s po zalogowaniu) zaczynało drugą
-  // operację i wywoływało DRUGIE okno PIN. Ale do 3.98.0 „dane dotarły”
-  // było fałszywe z konstrukcji, więc nie ma żadnego dowodu, że Serum
-  // kiedykolwiek dokańcza samo — a 3,5 s czekania płaciliśmy zawsze.
-  // Startujemy niżej; jeśli po NASZYM ponowieniu w ciągu ~2,5 s wyskoczy
-  // okno PIN (= zdublowana operacja), odstęp rośnie o krok do pułapu i tak
-  // zostaje do przeładowania strony. Koszt pomyłki: jedna dodatkowa runda
-  // logowania (PIN wpisuje się sam), nie utknięcie.
-  // 3.104.0: 2000 → 1500. Trzy kolejne zwolnienia (17.09, 18.09 09:03 i
-  // 09:49) — dane za każdym razem dopiero po NASZYM ponowieniu, ani razu
-  // wcześniej, ani razu zdublowane okno PIN. Dolną granicą pozostaje
-  // stabilizacja sesji (PUE_SESSION_SETTLE_MS), której to nie dotyka.
-  // 3.109.0: 1500 → 8000 (po zalogowaniu). Log 28.09.2026, 10:42:
-  //   10:42:02.307  okno PIN zamknięte (zalogowano)
-  //   10:42:03.461  NASZE ponowienie (1,2 s po zalogowaniu)
-  //   10:42:03.770  kolejne okno PIN — zdublowana operacja
-  // i to samo 22.09 oraz 28.09 08:30 — tamte „dane dopiero po naszym
-  // ponowieniu” to przychodziło 2,5–4 s po ZALOGOWANIU, czyli Serum
-  // dokańczało pobranie samo (17.09 08:22: dane 3,8 s po zalogowaniu bez
-  // żadnego ponowienia). Ponowienie zostaje tylko jako siatka
-  // bezpieczeństwa, gdy przez 8 s nic nie przyszło.
-  const EZLA_POBIERZ_RETRY_START_MS = 8000;
-  const EZLA_POBIERZ_RETRY_STEP_MS = 2000;
-  const EZLA_POBIERZ_RETRY_MAX_MS = 12000;
-  // Odstęp po NASZYM pierwszym wywołaniu (bez logowania w międzyczasie).
-  // Log 22.09 (12:02, 12:23) i 28.09 (11:05): gdy sesja PUE wygasła, ZUS
-  // odpowiadał oknem PIN dopiero po ~16 s, a my po 1,5–2,3 s strzelaliśmy
-  // drugim żądaniem w trwające pierwsze → „Błąd sesji”. Dopóki żądanie może
-  // jeszcze wisieć, nie wolno go dublować.
-  const EZLA_CZEKAJ_NA_ZUS_MS = 25000;
-  let ezlaPobierzPoLogowaniu = false;
-  let ezlaDaneOdebrane = false;
-  let ezlaRecznaEdycjaLogged = false;
-  let ezlaPobierzRetryMs = EZLA_POBIERZ_RETRY_START_MS;
-  // Kiedy i którą próbą ostatnio SAMI wywołaliśmy pobranie — modPueLogowanie
-  // porównuje to z chwilą pojawienia się okna PIN.
-  let ezlaOstatnieWywolanieAt = 0;
-  let ezlaOstatnieWywolanieProba = 0;
-  const EZLA_DUBEL_OKNO_MS = 2500;
-
-  function wydluzOdstepPonowieniaZus(powod) {
-    if (ezlaPobierzRetryMs >= EZLA_POBIERZ_RETRY_MAX_MS) return;
-    ezlaPobierzRetryMs = Math.min(EZLA_POBIERZ_RETRY_MAX_MS, ezlaPobierzRetryMs + EZLA_POBIERZ_RETRY_STEP_MS);
-    dbg('modEzlaPobierzZus: ' + powod + ' — wydłużam odstęp przed ponowieniem do ' + ezlaPobierzRetryMs + 'ms');
-  }
-
-  // Wołane z modPueLogowanie w chwili wykrycia okna PIN.
-  function odnotujOknoPinPoNaszymPonowieniu() {
-    if (ezlaOstatnieWywolanieProba < 2) return; // pierwsze pobranie MA prawo prosić o PIN
-    if (Date.now() - ezlaOstatnieWywolanieAt > EZLA_DUBEL_OKNO_MS) return;
-    wydluzOdstepPonowieniaZus('okno PIN ' + (Date.now() - ezlaOstatnieWywolanieAt) + 'ms po naszym ponowieniu (zdublowana operacja)');
-  }
-  let ezlaPobierzProby = 0;
-  let ezlaPobierzLastAt = 0;
-  let ezlaPobierzSnapshot = '';
-  let ezlaCzekaNaPinLogged = null;
-  let ezlaSettleLogged = 0;
-
-  // Potwierdzone inspektorem w oknie EZLA:
-  //   <input id="inp_pesel_ezla"        onchange="f_elza_pobierz_dane_z_zus()">
-  //   <input id="inp_imie_pac_ezla">
-  //   <input id="inp_nazwisko_pac_ezla">
-  // Po udanym pobraniu ZUS nadpisuje te pola swoją wersją danych (na zrzutach
-  // widać zmianę „Imię/Nazwisko” → „IMIĘ/NAZWISKO” — ZUS zwraca
-  // wersalikami), więc zmiana tego odcisku = ZUS odpowiedział.
-  function ezlaDaneSnapshot() {
-    const v = (id) => normLabel(document.getElementById(id)?.value || '');
-    return v('inp_pesel_ezla') + '|' + v('inp_imie_pac_ezla') + '|' + v('inp_nazwisko_pac_ezla');
-  }
-
-  function ezlaDaneWygladajaNaZus() {
-    const v = (id) => normLabel(document.getElementById(id)?.value || '');
-    const imie = v('inp_imie_pac_ezla');
-    const nazwisko = v('inp_nazwisko_pac_ezla');
-    return imie !== '' && nazwisko !== '' &&
-      imie === imie.toUpperCase() && nazwisko === nazwisko.toUpperCase();
-  }
-
-  function resetEzlaPobierz() {
-    ezlaPobierzDone = false;
-    ezlaPobierzProby = 0;
-    ezlaDaneOdebrane = false;
-    ezlaOstatnieWywolanieProba = 0;
-    // ezlaPobierzRetryMs celowo NIE wraca do startu — to wiedza o tym, jak
-    // zachowuje się serwer, nie stan jednego panelu.
-  }
-
-  // Wywoływane PO zalogowaniu do PUE (albo po zamknięciu „Błędu sesji”).
-  //
-  // Dotąd był tu resetEzlaPobierz(), czyli „kliknij Pobierz dane z ZUS
-  // jeszcze raz, jak tylko minie zwłoka”. Log z 18.08 pokazał, że to właśnie
-  // ten ponowny klik nakręcał pętlę logowań:
-  //   10:23:33.157  wywołano f_elza_pobierz_dane_z_zus()   ← nasz klik
-  //   10:23:33.251  okienko logowania wykryte              ← Serum żąda PIN-u
-  //   10:23:34.458  okno PIN zamknięte — logowanie OK
-  //   10:23:35.463  wywołano f_elza_pobierz_dane_z_zus()   ← nasz PONOWNY klik
-  //   10:23:35.895  okienko logowania wykryte              ← i ZNOWU PIN
-  // Po zalogowaniu Serum samo dokańcza przerwane pobranie; nasz drugi klik
-  // zaczynał DRUGĄ operację, która od nowa wymagała uwierzytelnienia.
-  //
-  // Dlatego zostawiamy krok jako wykonany i zdajemy się na sprawdzenie „czy
-  // dane faktycznie dotarły” (porównanie pól przez ezlaDaneSnapshot) — jeśli
-  // po ezlaPobierzRetryMs nic nie przyszło, DOPIERO wtedy ponawiamy.
-  function armEzlaPobierzRetry() {
-    ezlaPobierzDone = true;
-    ezlaPobierzProby = 1; // zostaje zapas ponowień, gdyby dane nie dotarły
-    ezlaPobierzLastAt = Date.now();
-    ezlaPobierzPoLogowaniu = true;
-    ezlaDaneOdebrane = false;
-    ezlaRecznaEdycjaLogged = false;
-    // BŁĄD do 3.98.0 (log 17.09.2026): odcisk „przed” był zapisywany TYLKO w
-    // ścieżce, w której to my wywołaliśmy pobranie. Gdy PIN wyskakiwał z
-    // własnej ścieżki Serum (onchange na PESEL-u), ta funkcja uzbrajała
-    // ponowienie z odciskiem pustym/po poprzednim pacjencie — a wtedy
-    // „pola się zmieniły” było prawdą zawsze, skrypt ogłaszał „dane dotarły”
-    // i nigdy nie ponawiał. Odcisk bierzemy TERAZ, w chwili uzbrojenia.
-    ezlaPobierzSnapshot = ezlaDaneSnapshot();
-  }
-
-  // Diagnostyka „tekst przycisku jest na stronie, ale przycisku nie znalazłem”
-  // — raz na wystąpienie (flaga zerowana, gdy przycisk się znajdzie albo tekst
-  // zniknie ze strony). Do 15.09.2026 ta ścieżka milczała całkowicie, więc
-  // zgłoszenia „Pobierz dane z ZUS nie wyzwala się” nie dało się rozstrzygnąć
-  // z logu. Selektor obejmuje też LIŚCIE span/div (elementy bez dzieci) — na
-  // wypadek, gdyby Serum zmieniło przycisk z <a> na coś innego; f_elza_...
-  // i tak wołamy wprost, element służy głównie jako dowód, że panel jest.
-  let ezlaBrakPrzyciskuLogged = false;
-  const EZLA_POBIERZ_LABEL_LOWER = EZLA_POBIERZ_LABEL.toLowerCase();
-
-  function findEzlaPobierzButton() {
-    // Bramka tekstowa ze wspólnego cache'u — bez niej ta funkcja przemiatała
-    // WSZYSTKIE przyciski i odnośniki na stronie przy KAŻDYM ticku, na każdej
-    // podstronie Serum, nawet gdy okna eZLA w ogóle nie było na ekranie.
-    //
-    // Bramka działa na SUROWYM tekście strony (bez zwijania odstępów — to
-    // celowo, normalizacja całego tekstu kosztuje kilka ms na tick). Cena:
-    // twarda spacja albo złamanie wiersza wewnątrz etykiety w DOM sprawiały,
-    // że fraza „nie występowała” i moduł po cichu nie robił NIC. Stąd druga,
-    // luźniejsza bramka po pojedynczych słowach (tych odstęp nie rozbije) —
-    // wtedy skanujemy tylko przyciski/odnośniki (tanio) i porównujemy etykiety
-    // już po normalizacji.
-    // Szybka ścieżka (log 18.09.2026: 2,2 ms na tick bez niej): przycisk ma
-    // stały href — <a class="a_akc" href="javascript:f_elza_pobierz_dane_z_zus()">.
-    // Jedno zapytanie zamiast skanu etykiet. Jeśli odnośnik JEST, ale
-    // niewidoczny (ukryta zakładka eZLA — tekst siedzi w DOM panelu wizyty na
-    // stałe), odpowiedź brzmi „nie ma” i koniec; skan etykiet zostaje tylko
-    // na wypadek, gdyby Serum zmieniło href.
-    const byHref = document.querySelector('a[href*="f_elza_pobierz_dane_z_zus"]');
-    if (byHref) {
-      ezlaBrakPrzyciskuLogged = false;
-      return isOverlayElementVisible(byHref) ? byHref : null;
+      dbg('eZLA: po ' + PUE_PIN_CZEKAJ_MAX_MS + ' ms wciąż w toku: ' + wToku + ' — wysyłam PIN mimo to');
     }
+    clearTimeout(pueCzekaTimer);
 
-    const lower = getBodyTextLower();
-    const frazaDokladnie = lower.includes(EZLA_POBIERZ_LABEL_LOWER);
-    if (!frazaDokladnie) {
-      ezlaBrakPrzyciskuLogged = false;
-      if (!lower.includes('pobierz') || !lower.includes('zus')) return null;
-    }
-    const selektor = frazaDokladnie
-      ? 'button, input[type="button"], input[type="submit"], a, span, div'
-      : 'button, input[type="button"], input[type="submit"], a';
-    const kandydaci = [];
-    for (const el of document.querySelectorAll(selektor)) {
-      // Tani test tekstu PRZED sprawdzeniem widoczności (to drugie wymusza
-      // przeliczenie układu strony) — wcześniej było odwrotnie.
-      // Bez wielkości liter — „Pobierz dane z ZUS” vs „POBIERZ DANE Z ZUS” to
-      // wciąż ten sam przycisk.
-      if (el.children.length > 0 && el.tagName !== 'BUTTON' && el.tagName !== 'A') continue;
-      if (normLabel(el.textContent || el.value).toLowerCase() !== EZLA_POBIERZ_LABEL_LOWER) continue;
-      kandydaci.push(el);
-      if (!isOverlayElementVisible(el)) continue;
-      ezlaBrakPrzyciskuLogged = false;
-      return el;
-    }
-    // Wpis tylko przy dokładnej frazie (= na pewno panel eZLA); luźna bramka
-    // przechodzi też na zwykłym panelu wizyty („eZLA (ZUS): OK” w nagłówku +
-    // jakiś „Pobierz”), a tam brak przycisku jest normalny.
-    if (frazaDokladnie && !ezlaBrakPrzyciskuLogged) {
-      ezlaBrakPrzyciskuLogged = true;
-      dbg(
-        'modEzlaPobierzZus: tekst „' + EZLA_POBIERZ_LABEL + '” jest na stronie, ale WIDOCZNEGO przycisku nie ma' +
-          ' — kandydatów z tym tekstem: ' + kandydaci.length +
-          (kandydaci.length ? ' [' + kandydaci.map(describeEl).join(' ; ') + ']' : '')
-      );
-    }
-    return null;
-  }
-
-  function modEzlaPobierzZus() {
-    // Przycisk „Pobierz dane z ZUS” bywa widoczny/aktywny nawet gdy nad nim
-    // wisi okienko logowania do PUE — kliknięcie go w tym momencie (przed
-    // wysłaniem PIN-u) nakłada się na trwające logowanie i najwyraźniej myli
-    // sesję po stronie serwera (stąd „Błąd sesji” tuż po zalogowaniu). Dopóki
-    // logowanie trwa, zostawiamy ten przycisk w spokoju — modPueLogowanie
-    // samo zresetuje ezlaPobierzDone po zakończeniu logowania.
-    const pueLoginPin = document.getElementById('inp_ezla_logowanie_pin');
-    if (isOverlayElementVisible(pueLoginPin)) {
-      if (ezlaCzekaNaPinLogged !== pueLoginPin) {
-        ezlaCzekaNaPinLogged = pueLoginPin;
-        dbg('modEzlaPobierzZus: nad panelem wisi okno PIN do PUE — czekam z pobraniem, aż logowanie się domknie');
-      }
+    puePinWyslanyDo = pin;
+    const kod = puePin();
+    if (!kod) {
+      dbg('eZLA: brak zapisanego PIN-u do PUE — wpisz ręcznie lub ustaw w menu');
       return;
     }
+    pueLoginyZRzedu++;
+    submitPueLogin(pin, kod);
+  }
 
-    // Sesja PUE tuż po zalogowaniu potrzebuje chwili, zanim zniesie zapytanie
-    // o dane z ZUS — dotyczy to RÓWNIEŻ pierwszej, naturalnej próby (nie tylko
-    // powtórek po resecie ezlaPobierzDone), więc sprawdzamy to tutaj, zamiast
-    // liczyć na to, że ezlaPobierzDone akurat już było ustawione.
-    if (Date.now() < pueSessionSettleUntil) {
-      zaplanujTickZa(pueSessionSettleUntil - Date.now() + 30);
-      if (ezlaSettleLogged !== pueSessionSettleUntil) {
-        ezlaSettleLogged = pueSessionSettleUntil;
-        dbg('modEzlaPobierzZus: sesja PUE jeszcze się stabilizuje — czekam do ' +
-          new Date(pueSessionSettleUntil).toLocaleTimeString('pl-PL') + '.' +
-          String(pueSessionSettleUntil % 1000).padStart(3, '0'));
-      }
+  function ezlaPobierzPoZalogowaniuJesliTrzeba() {
+    if (!ezlaPobierzPoZalogowaniu) return;
+    // Bez formularza w trybie bieżącym f_elza_pobierz_dane_z_zus() i tak nic
+    // nie robi (f_ezla_czy_tryb_biez), a dane mogły już przyjść.
+    if (ezlaDaneZZus || document.getElementById('hid_ezla_tryb')?.value !== 'B') {
+      ezlaPobierzPoZalogowaniu = false;
       return;
     }
+    // Coś z eZLA wciąż w toku (spóźnione zapytanie sprzed logowania, kolejne
+    // okno PIN w drodze) albo trwa następna runda PIN-u — równoległe
+    // pobranie to dokładnie ten dubel, który kończył się „Błędem sesji”.
+    // Czekamy; koniec każdego żądania wywoła nas ponownie.
+    if (ezlaWTokuOpis() || isOverlayElementVisible(document.getElementById('inp_ezla_logowanie_pin'))) return;
 
-    const btn = findEzlaPobierzButton();
-    if (!btn) {
-      // Panel eZLA zamknięty — pełny reset, żeby przy następnym otwarciu
-      // pobranie zadziałało od nowa.
-      resetEzlaPobierz();
-      return;
-    }
-
-    if (ezlaPobierzDone) {
-      if (ezlaDaneOdebrane) return;
-      // Dane w polach się zmieniły → ZUS odpowiedział, nie ma czego ponawiać.
-      // Sama zmiana odcisku nie wystarcza: lekarz może w tym czasie dopisywać
-      // imię/nazwisko ręcznie. ZUS zwraca dane WERSALIKAMI (potwierdzone
-      // zrzutami), więc wymagamy dodatkowo, żeby imię i nazwisko były
-      // niepuste i w całości wielkimi literami. Zmiana bez wersalików =
-      // pisze lekarz — odświeżamy odcisk i czekamy dalej.
-      const teraz = ezlaDaneSnapshot();
-      if (teraz !== ezlaPobierzSnapshot) {
-        if (ezlaDaneWygladajaNaZus()) {
-          // Sprawdzane KAŻDY tick, także po wyczerpaniu prób — do 3.108.0
-          // test siedział za limitem prób i przy MAX=2 wpis „dotarły” po
-          // ostatnim ponowieniu nigdy się nie pojawiał (log 28.09).
-          ezlaDaneOdebrane = true;
-          ezlaPobierzProby = EZLA_POBIERZ_MAX_PROB; // zamknij temat do końca panelu
-          dbg('modEzlaPobierzZus: dane z ZUS dotarły ' + ((Date.now() - ezlaPobierzLastAt) / 1000).toFixed(1) +
-            's po ' + (ezlaPobierzPoLogowaniu ? 'zalogowaniu/ponowieniu' : 'wywołaniu') + ' — nie ponawiam');
-          return;
-        }
-        if (!ezlaRecznaEdycjaLogged) {
-          ezlaRecznaEdycjaLogged = true;
-          dbg('modEzlaPobierzZus: pola się zmieniły, ale bez wersalików (edycja ręczna?) — czekam dalej na ZUS');
-        }
-        ezlaPobierzSnapshot = teraz;
-        ezlaPobierzLastAt = Date.now();
-        return;
-      }
-
-      if (ezlaPobierzProby >= EZLA_POBIERZ_MAX_PROB) return;
-      const czekajMs = ezlaPobierzPoLogowaniu ? ezlaPobierzRetryMs : EZLA_CZEKAJ_NA_ZUS_MS;
-      if (Date.now() - ezlaPobierzLastAt < czekajMs) {
-        zaplanujTickZa(ezlaPobierzLastAt + czekajMs - Date.now() + 30);
-        return;
-      }
-
-      dbg(
-        'modEzlaPobierzZus: brak odpowiedzi z ZUS po ' +
-          ((Date.now() - ezlaPobierzLastAt) / 1000).toFixed(1) + 's — ponawiam (próba ' +
-          (ezlaPobierzProby + 1) + '/' + EZLA_POBIERZ_MAX_PROB + ')'
-      );
-    }
-
-    ezlaPobierzDone = true;
-    ezlaPobierzProby++;
-    ezlaPobierzLastAt = Date.now();
-    ezlaPobierzPoLogowaniu = false;
-    ezlaRecznaEdycjaLogged = false;
-    ezlaPobierzSnapshot = ezlaDaneSnapshot();
-    ezlaOstatnieWywolanieAt = ezlaPobierzLastAt;
-    ezlaOstatnieWywolanieProba = ezlaPobierzProby;
-
-    // DIAGNOSTYKA: na zrzucie ekranu „Pobierz dane z ZUS” bywa wyblakły
-    // (nieaktywny), gdy nad nim wisi okienko PIN — a skrypt i tak go klika i
-    // od razu oznacza jako zrobione, więc przy nieudanym pobraniu nic już nie
-    // ponawia. Logujemy stan przycisku, żeby ustalić, JAK strona zaznacza
-    // jego nieaktywność (klasa CSS? aria-disabled? nic?).
+    ezlaPobierzPoZalogowaniu = false;
     const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-    if (typeof uw.f_elza_pobierz_dane_z_zus === 'function') {
-      try {
-        uw.f_elza_pobierz_dane_z_zus();
-        dbg('modEzlaPobierzZus: wywołano f_elza_pobierz_dane_z_zus() | przycisk=' + describeEl(btn));
-        return;
-      } catch (e) {
-        dbg('modEzlaPobierzZus: błąd f_elza_pobierz_dane_z_zus(): ' + e);
-      }
+    if (typeof uw.f_elza_pobierz_dane_z_zus !== 'function') {
+      dbg('eZLA: brak funkcji f_elza_pobierz_dane_z_zus — nie pobieram');
+      return;
     }
-    dbg('modEzlaPobierzZus: klik Pobierz dane z ZUS | przycisk=' + describeEl(btn));
-    btn.click();
+    uw.f_elza_pobierz_dane_z_zus();
+    dbg('eZLA: wywołano f_elza_pobierz_dane_z_zus() ' + (Date.now() - pueZalogowanoAt) + ' ms po zalogowaniu');
+  }
+
+  // Wołane po każdej odpowiedzi eZLA oraz z uiTick() — w ticku to dwa tanie
+  // sprawdzenia (getElementById i flaga), siatka na zmiany bez żądań XHR
+  // (np. ręczne zamknięcie okna PIN).
+  function modEzlaPue() {
+    pueSprobujPin();
+    ezlaPobierzPoZalogowaniuJesliTrzeba();
   }
 
   // --- ZLA: auto-PIN przy „Podpisz i wyślij do ZUS” ---
@@ -5507,9 +5148,7 @@
     ['modWyslijSms', modWyslijSms],
     ['modPodpiszERecepte', modPodpiszERecepte],
     ['modPodpiszIpom', modPodpiszIpom],
-    ['modPueLogowanie', modPueLogowanie],
-    ['modBladSesjiZus', modBladSesjiZus],
-    ['modEzlaPobierzZus', modEzlaPobierzZus],
+    ['modEzlaPue', modEzlaPue],
     ['modEzlaPodpis', modEzlaPodpis],
     ['modEzlaOstrzezenieWyslij', modEzlaOstrzezenieWyslij],
     ['modPowodEdycji', modPowodEdycji],
@@ -5746,37 +5385,6 @@
       uiTimer = null;
       uiTick();
     }, 400);
-  }
-
-  // Bez debounce'a — dla zdarzeń, na które czeka użytkownik z rękami nad
-  // klawiaturą (okno PIN do PUE). setTimeout(0) tylko po to, żeby wyjść z
-  // callbacku obserwatora, zanim ruszymy DOM.
-  function scheduleUiNatychmiast() {
-    if (uiTimer) clearTimeout(uiTimer);
-    uiTimer = setTimeout(() => {
-      uiTimer = null;
-      uiTick();
-    }, 0);
-  }
-
-  // Tick o KONKRETNEJ godzinie — dla modułów, które wiedzą, kiedy będą mogły
-  // coś zrobić (koniec stabilizacji sesji PUE, koniec odstępu przed
-  // ponowieniem „Pobierz dane z ZUS”). Bez tego po zamknięciu okna PIN strona
-  // jest cicha i następny tick przychodzi dopiero z interwału bezpieczeństwa
-  // (3 s): log 18.09.2026 — ponowienie dozwolone o +2,0 s, wykonane o +4,5 s.
-  // Jeden timer; wcześniejszy termin wygrywa.
-  let uiTimerDokladny = null;
-  let uiTimerDokladnyAt = 0;
-  function zaplanujTickZa(ms) {
-    const opoznienie = Math.max(0, Math.round(ms));
-    const at = Date.now() + opoznienie;
-    if (uiTimerDokladny && uiTimerDokladnyAt <= at) return;
-    if (uiTimerDokladny) clearTimeout(uiTimerDokladny);
-    uiTimerDokladnyAt = at;
-    uiTimerDokladny = setTimeout(() => {
-      uiTimerDokladny = null;
-      uiTick();
-    }, opoznienie);
   }
 
   function scheduleUiSoon() {
@@ -6081,8 +5689,7 @@
         }
         domWersja++;
         noteTickTrigger(rec);
-        if (pojawilSiePinPue()) scheduleUiNatychmiast();
-        else scheduleUi();
+        scheduleUi();
         return;
       }
     });
