@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.117.0
+// @version      3.118.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,233 +23,36 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.117.0';
+  const SCRIPT_VERSION = '3.118.0';
 
-  // =====================================================================
-  // MODUŁ: auto OK dialogi (dawniej serum-dialogs.user.js)
-  // Musi wystartować na document-start, zanim strona zdąży wywołać własne
-  // alert/confirm — dlatego działa jako pierwsza rzecz w tym pliku,
-  // niezależnie od reszty (która czeka na dostępność <body>).
-  // =====================================================================
-  (function serumDialogsModule() {
-    const PATCH_KEY = '__serumDialogsPatched';
-
-    function norm(msg) {
-      return msg == null ? '' : String(msg).toLowerCase();
-    }
-
-    function notifySmsSent() {
-      try {
-        document.dispatchEvent(new CustomEvent('serum-sms-sent'));
-      } catch (_) {}
-    }
-
-    function handleAlert(msg) {
-      const s = norm(msg);
-      if (s.trim().startsWith('wysłano sms o treści')) {
-        notifySmsSent();
-        return true;
-      }
-      if (s.includes('dokument został podpisany')) return true;
-      // „Wysłano do P1” po podpisaniu IPOM-u — samo powiadomienie.
-      if (s.trim().startsWith('wysłano do p1')) return true;
-      if (s.includes('dokumenty zostały wysłane do zus')) return true;
-      if (s.includes('zapisać świadczenie') && s.includes('odznaczony') && s.includes('kontynuować')) return true;
-      // „Wróciły wyniki badań laboratoryjnych do zlecenia nr: 0003553105” —
-      // powiadomienie bez decyzji do podjęcia (jeden przycisk OK), wyskakujące
-      // w trakcie pracy nad inną wizytą. Numer zlecenia jest za każdym razem
-      // inny, więc dopasowujemy samą frazę.
-      if (s.includes('wróciły wyniki badań laboratoryjnych')) return true;
-      return false;
-    }
-
-    function handleConfirm(msg) {
-      const s = norm(msg);
-      if (s.includes('antropometrii')) {
-        if (s.includes('zapisać wizytę') || s.includes('zapisac wizyte')) return true;
-        if (s.includes('uzupełnić') || s.includes('uzupelnic')) return false;
-      }
-      if (s.trim().startsWith('wysłano sms o treści')) {
-        notifySmsSent();
-        return true;
-      }
-      if (s.includes('dokument został podpisany')) return true;
-      // „Wysłano do P1” po podpisaniu IPOM-u — samo powiadomienie.
-      if (s.trim().startsWith('wysłano do p1')) return true;
-      if (s.includes('dokumenty zostały wysłane do zus')) return true;
-      if (s.includes('zapisać świadczenie') && s.includes('odznaczony') && s.includes('kontynuować')) return true;
-      // „Nie podano kodu procedury ICD-9. Czy kontynuować?” przy zapisie
-      // SKIEROWANIA (f_zapisz_skier_spec). To natywne okno przeglądarki —
-      // nie ma go w DOM, więc nie da się go kliknąć ani obejrzeć inspektorem;
-      // jedyne wejście to podmiana window.confirm, co ten moduł już robi.
-      // Warunek bez sztywnego „icd-9”, żeby zadziałał też przy zapisie „ICD9”.
-      if (s.includes('nie podano kodu procedury') && s.includes('kontynuować')) return true;
-      // „Co najmniej jedno z pól jest już uzupełnione. Czy chcesz dopisać
-      // wartości z szablonu charakteru wizyty…?” — też natywne okno confirm().
-      if (s.includes('szablonu charakteru wizyty')) return true;
-      return null;
-    }
-
-    function patch(win) {
-      if (!win || win[PATCH_KEY]) return;
-      win[PATCH_KEY] = true;
-
-      try {
-        const nativeAlert = win.alert.bind(win);
-        win.alert = function (msg) {
-          if (handleAlert(msg)) return undefined;
-          return nativeAlert.apply(this, arguments);
-        };
-      } catch (_) {}
-
-      try {
-        const nativeConfirm = win.confirm.bind(win);
-        win.confirm = function (msg) {
-          const answer = handleConfirm(msg);
-          if (answer !== null) return answer;
-          return nativeConfirm.apply(this, arguments);
-        };
-      } catch (_) {}
-
-      try {
-        const proto = win.Window ? win.Window.prototype : Window.prototype;
-        if (!proto[PATCH_KEY]) {
-          proto[PATCH_KEY] = true;
-          const nativeAlert = proto.alert;
-          const nativeConfirm = proto.confirm;
-          proto.alert = function (msg) {
-            if (handleAlert(msg)) return undefined;
-            return nativeAlert.apply(this, arguments);
-          };
-          proto.confirm = function (msg) {
-            const answer = handleConfirm(msg);
-            if (answer !== null) return answer;
-            return nativeConfirm.apply(this, arguments);
-          };
-        }
-      } catch (_) {}
-    }
-
-    function injectIntoPage() {
-      const code = `
-        (function () {
-          var PATCH_KEY = '__serumDialogsPatched';
-          function norm(msg) { return msg == null ? '' : String(msg).toLowerCase(); }
-          function notifySmsSent() {
-            try { document.dispatchEvent(new CustomEvent('serum-sms-sent')); } catch (e) {}
-          }
-          function handleAlert(msg) {
-            var s = norm(msg);
-            if (s.trim().indexOf('wysłano sms o treści') === 0) {
-              notifySmsSent();
-              return true;
-            }
-            if (s.indexOf('dokument został podpisany') !== -1) return true;
-            if (s.indexOf('dokumenty zostały wysłane do zus') !== -1) return true;
-            if (s.indexOf('zapisać świadczenie') !== -1 && s.indexOf('odznaczony') !== -1 && s.indexOf('kontynuować') !== -1) return true;
-            if (s.indexOf('wróciły wyniki badań laboratoryjnych') !== -1) return true;
-            return false;
-          }
-          function handleConfirm(msg) {
-            var s = norm(msg);
-            if (s.indexOf('antropometrii') !== -1) {
-              if (s.indexOf('zapisać wizytę') !== -1 || s.indexOf('zapisac wizyte') !== -1) return true;
-              if (s.indexOf('uzupełnić') !== -1 || s.indexOf('uzupelnic') !== -1) return false;
-            }
-            if (s.trim().indexOf('wysłano sms o treści') === 0) {
-              notifySmsSent();
-              return true;
-            }
-            if (s.indexOf('dokument został podpisany') !== -1) return true;
-            if (s.indexOf('dokumenty zostały wysłane do zus') !== -1) return true;
-            if (s.indexOf('zapisać świadczenie') !== -1 && s.indexOf('odznaczony') !== -1 && s.indexOf('kontynuować') !== -1) return true;
-            if (s.indexOf('nie podano kodu procedury') !== -1 && s.indexOf('kontynuować') !== -1) return true;
-            if (s.indexOf('szablonu charakteru wizyty') !== -1) return true;
-            return null;
-          }
-          function patch(win) {
-            if (!win || win[PATCH_KEY]) return;
-            win[PATCH_KEY] = true;
-            try {
-              var nativeAlert = win.alert.bind(win);
-              win.alert = function (msg) {
-                if (handleAlert(msg)) return undefined;
-                return nativeAlert.apply(this, arguments);
-              };
-            } catch (e) {}
-            try {
-              var nativeConfirm = win.confirm.bind(win);
-              win.confirm = function (msg) {
-                var answer = handleConfirm(msg);
-                if (answer !== null) return answer;
-                return nativeConfirm.apply(this, arguments);
-              };
-            } catch (e) {}
-            try {
-              var proto = win.Window ? win.Window.prototype : Window.prototype;
-              if (!proto[PATCH_KEY]) {
-                proto[PATCH_KEY] = true;
-                var pAlert = proto.alert;
-                var pConfirm = proto.confirm;
-                proto.alert = function (msg) {
-                  if (handleAlert(msg)) return undefined;
-                  return pAlert.apply(this, arguments);
-                };
-                proto.confirm = function (msg) {
-                  var answer = handleConfirm(msg);
-                  if (answer !== null) return answer;
-                  return pConfirm.apply(this, arguments);
-                };
-              }
-            } catch (e) {}
-          }
-          patch(window);
-          var watchedFrames = (typeof WeakSet !== 'undefined') ? new WeakSet() : null;
-          function tryPatchFrame(frame) {
-            try { if (frame.contentWindow) patch(frame.contentWindow); } catch (e) {}
-          }
-          function watchFrame(frame) {
-            if (watchedFrames) {
-              if (watchedFrames.has(frame)) return;
-              watchedFrames.add(frame);
-            }
-            tryPatchFrame(frame);
-            frame.addEventListener('load', function () { tryPatchFrame(frame); });
-          }
-          function watchFramesIn(root) {
-            if (!root || !root.querySelectorAll) return;
-            if (root.nodeName === 'IFRAME' || root.nodeName === 'FRAME') watchFrame(root);
-            var nodes = root.querySelectorAll('iframe, frame');
-            for (var i = 0; i < nodes.length; i++) watchFrame(nodes[i]);
-          }
-          watchFramesIn(document);
-          new MutationObserver(function (records) {
-            for (var i = 0; i < records.length; i++) {
-              for (var j = 0; j < records[i].addedNodes.length; j++) {
-                watchFramesIn(records[i].addedNodes[j]);
-              }
-            }
-          }).observe(document.documentElement, { childList: true, subtree: true });
-        })();
-      `;
+  // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
+  // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
+  // TM i w Firefoksie, i w Chromium/Brave i tak wpuszcza skrypt na stronę
+  // (tryb „raw”), ale gdyby kiedyś przełączył na piaskownicę, kod strony
+  // dalej działałby tak samo. Na document-start kod strony jeszcze nie ruszył.
+  function wstrzyknijDoStrony(fn) {
+    function inject() {
       const el = document.createElement('script');
-      el.textContent = code;
+      el.textContent = '(' + fn + ')();';
       (document.documentElement || document.head || document).appendChild(el);
       el.remove();
     }
-
-    patch(typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
-
-    if (document.documentElement) {
-      injectIntoPage();
-    } else {
-      document.addEventListener('DOMContentLoaded', injectIntoPage, { once: true });
-    }
-  })();
+    if (document.documentElement) inject();
+    else document.addEventListener('DOMContentLoaded', inject, { once: true });
+  }
 
   // =====================================================================
-  // MODUŁ: fałszywe „Dawkomat chwilowo nie odpowiada”
-  // prescriptions.js (initDawkomat) trzyma JEDEN wspólny timer 15 s
+  // MODUŁ: natywne okna alert/confirm strony (dawniej serum-dialogs.user.js)
+  // + fałszywe „Dawkomat chwilowo nie odpowiada”
+  // Jeden kod, wyłącznie w kontekście strony. Wcześniej reguły były dwa razy
+  // (kopia dla piaskownicy i kopia wstrzykiwana) i zdążyły się rozjechać.
+  // Łatane jest samo okno: alert/confirm to własne pola window, a
+  // Window.prototype.alert nie istnieje ani w Firefoksie, ani w Chromium
+  // (sprawdzone), więc łatka prototypu nic nie robiła.
+  // Musi wystartować na document-start, zanim strona zdąży wywołać własne
+  // alert/confirm — dlatego to pierwsza rzecz w tym pliku.
+  //
+  // Dawkomat: prescriptions.js (initDawkomat) trzyma JEDEN wspólny timer 15 s
   // (self.dawkomatTimer) dla wszystkich recept. Przy kilku receptach naraz
   // każda nadpisuje uchwyt poprzedniej, a pierwsza wiadomość z dowolnej ramki
   // Dawkomatu kasuje tylko ostatni timer — wcześniejsze odpalają confirm,
@@ -259,91 +62,178 @@
   // Gdy wszystkie się odezwały — to fałszywy alarm, cicho „Anuluj”.
   // Gdy któraś naprawdę milczy — przeładowujemy ją i dajemy jej jeszcze 20 s;
   // dopiero potem pytamy jak Serum i przy „OK” przełączamy jak initDawkomat.
-  // Działa w kontekście strony (jak moduł dialogów), w oknie głównym
-  // i w ramkach z tej samej domeny.
+  // Działa w oknie głównym i w ramkach z tej samej domeny.
   // =====================================================================
-  (function serumDawkomatModule() {
-    const code = `
-      (function () {
-        var KEY = '__serumDawkomatFix';
-        function install(win) {
-          if (!win || win[KEY]) return;
-          win[KEY] = true;
-          var doc = win.document;
-          var odezwane = new WeakSet();
-          var ponowione = new WeakSet();
-          win.addEventListener('message', function (e) {
-            if (e.source) odezwane.add(e.source);
-          }, true);
-          function milczy(f) {
-            try { return !f.contentWindow || !odezwane.has(f.contentWindow); } catch (e) { return true; }
-          }
-          function naStandard(f) {
-            var row = f.closest('.x-prescriptionDrugRow');
-            if (!row) return;
-            var $ = win.$Q;
-            if ($) {
-              $('.x-dawkomatCheck', row).prop('checked', false);
-              $('.x-drugDaysPanel, .x-drugDosagePanel', row).show();
-              $('.x-drugDosageDawkomatPanel', row).hide();
-              $(row).find('.x-drugDosageDawkomat').html('');
-              $(row).find('.x-dosageDocumentDescription, .x-dosageDocumentId, .x-dosageDocument').val('');
-            }
-          }
-          var nativeConfirm = win.confirm;
-          win.confirm = function (msg) {
-            if (String(msg == null ? '' : msg).toLowerCase().indexOf('dawkomat chwilowo nie odpowiada') === -1) {
-              return nativeConfirm.apply(this, arguments);
-            }
-            var ramki = Array.prototype.slice.call(doc.querySelectorAll('iframe.dawkomat-frame')).filter(milczy);
-            if (!ramki.length) {
-              console.log('[serum-ui] Dawkomat: fałszywy alarm (wszystkie ramki odpowiedziały) — Anuluj');
-              return false;
-            }
-            var nowe = ramki.filter(function (f) { return !ponowione.has(f); });
-            if (!nowe.length) return nativeConfirm.apply(this, arguments);
-            nowe.forEach(function (f) {
-              ponowione.add(f);
-              console.log('[serum-ui] Dawkomat: ramka milczy 15 s — przeładowuję');
-              f.src = f.src;
-            });
-            var self = this;
-            win.setTimeout(function () {
-              var wciaz = nowe.filter(function (f) { return f.isConnected && milczy(f); });
-              if (!wciaz.length) return;
-              console.log('[serum-ui] Dawkomat: nadal milczy po przeładowaniu');
-              if (nativeConfirm.call(self, msg)) wciaz.forEach(naStandard);
-            }, 20000);
-            return false;
-          };
-        }
-        install(window);
-        function ramka(f) {
-          try { install(f.contentWindow); } catch (e) {}
-          f.addEventListener('load', function () { try { install(f.contentWindow); } catch (e) {} });
-        }
-        function skanuj(root) {
-          if (!root || !root.querySelectorAll) return;
-          if (root.nodeName === 'IFRAME' || root.nodeName === 'FRAME') ramka(root);
-          var n = root.querySelectorAll('iframe, frame');
-          for (var i = 0; i < n.length; i++) ramka(n[i]);
-        }
-        skanuj(document);
-        new MutationObserver(function (rs) {
-          for (var i = 0; i < rs.length; i++)
-            for (var j = 0; j < rs[i].addedNodes.length; j++) skanuj(rs[i].addedNodes[j]);
-        }).observe(document.documentElement, { childList: true, subtree: true });
-      })();
-    `;
-    function inject() {
-      const el = document.createElement('script');
-      el.textContent = code;
-      (document.documentElement || document.head || document).appendChild(el);
-      el.remove();
+  function dialogiStrony() {
+    var KEY = '__serumDialogi';
+    if (window[KEY]) return;
+
+    function norm(msg) { return msg == null ? '' : String(msg).toLowerCase(); }
+
+    function smsWyslany() {
+      try { document.dispatchEvent(new CustomEvent('serum-sms-sent')); } catch (e) {}
     }
-    if (document.documentElement) inject();
-    else document.addEventListener('DOMContentLoaded', inject, { once: true });
-  })();
+
+    // Powiadomienia bez decyzji do podjęcia — zamykane jak „OK”, czy przyszły
+    // jako alert, czy jako confirm.
+    function powiadomienie(s) {
+      if (s.trim().indexOf('wysłano sms o treści') === 0) {
+        smsWyslany();
+        return true;
+      }
+      if (s.indexOf('dokument został podpisany') !== -1) return true;
+      // „Wysłano do P1” po podpisaniu IPOM-u.
+      if (s.trim().indexOf('wysłano do p1') === 0) return true;
+      if (s.indexOf('dokumenty zostały wysłane do zus') !== -1) return true;
+      if (s.indexOf('zapisać świadczenie') !== -1 && s.indexOf('odznaczony') !== -1 && s.indexOf('kontynuować') !== -1) return true;
+      return false;
+    }
+
+    // Lista ostrzeżeń recepty to linie „ - …” (prescriptions.js,
+    // validateCommonFieldsWarn) — po jednej liście na każdą receptę.
+    // true tylko, gdy na wszystkich listach jest wyłącznie brak rozpoznania.
+    function tylkoBrakRozpoznania(s) {
+      var linie = s.split('\n');
+      var jest = false;
+      for (var i = 0; i < linie.length; i++) {
+        var l = linie[i].trim();
+        if (l.charAt(0) !== '-') continue;
+        if (l !== '- nie wybrano rozpoznania.') return false;
+        jest = true;
+      }
+      return jest;
+    }
+
+    function handleAlert(msg) {
+      var s = norm(msg);
+      if (powiadomienie(s)) return true;
+      // „Wróciły wyniki badań laboratoryjnych do zlecenia nr: 0003553105” —
+      // powiadomienie (jeden przycisk OK), wyskakujące w trakcie pracy nad
+      // inną wizytą. Numer zlecenia jest za każdym razem inny.
+      if (s.indexOf('wróciły wyniki badań laboratoryjnych') !== -1) return true;
+      return false;
+    }
+
+    // true/false = odpowiedź za użytkownika, null = pokaż okno.
+    function handleConfirm(msg) {
+      var s = norm(msg);
+      if (s.indexOf('antropometrii') !== -1) {
+        if (s.indexOf('zapisać wizytę') !== -1 || s.indexOf('zapisac wizyte') !== -1) return true;
+        if (s.indexOf('uzupełnić') !== -1 || s.indexOf('uzupelnic') !== -1) return false;
+      }
+      if (powiadomienie(s)) return true;
+      // „Nie podano kodu procedury ICD-9. Czy kontynuować?” przy zapisie
+      // SKIEROWANIA (f_zapisz_skier_spec). Bez sztywnego „icd-9”, żeby
+      // zadziałało też przy zapisie „ICD9”.
+      if (s.indexOf('nie podano kodu procedury') !== -1 && s.indexOf('kontynuować') !== -1) return true;
+      // „Co najmniej jedno z pól jest już uzupełnione. Czy chcesz dopisać
+      // wartości z szablonu charakteru wizyty…?”
+      if (s.indexOf('szablonu charakteru wizyty') !== -1) return true;
+      // „ - Nie wybrano rozpoznania. … Czy na pewno zapisać receptę?” przy
+      // zapisie/wysyłce recepty (prescriptions.js: validateCommonFieldsWarn,
+      // klucz prescriptions.form.validationMessage.noDiagnosis). „OK” tylko,
+      // gdy to jedyne ostrzeżenie — brak oddziału NFZ, odpłatności, dawkowania
+      // itd. dalej pyta. „…na recepcie refundowanej” to blokujący alert z
+      // błędem i zostaje bez zmian.
+      if (s.indexOf('czy na pewno zapisać receptę') !== -1 && tylkoBrakRozpoznania(s)) return true;
+      return null;
+    }
+
+    function dawkomat(win) {
+      var doc = win.document;
+      var odezwane = new WeakSet();
+      var ponowione = new WeakSet();
+      win.addEventListener('message', function (e) {
+        if (e.source) odezwane.add(e.source);
+      }, true);
+      function milczy(f) {
+        try { return !f.contentWindow || !odezwane.has(f.contentWindow); } catch (e) { return true; }
+      }
+      function naStandard(f) {
+        var row = f.closest('.x-prescriptionDrugRow');
+        if (!row) return;
+        var $ = win.$Q;
+        if ($) {
+          $('.x-dawkomatCheck', row).prop('checked', false);
+          $('.x-drugDaysPanel, .x-drugDosagePanel', row).show();
+          $('.x-drugDosageDawkomatPanel', row).hide();
+          $(row).find('.x-drugDosageDawkomat').html('');
+          $(row).find('.x-dosageDocumentDescription, .x-dosageDocumentId, .x-dosageDocument').val('');
+        }
+      }
+      var nativeConfirm = win.confirm;
+      win.confirm = function (msg) {
+        if (norm(msg).indexOf('dawkomat chwilowo nie odpowiada') === -1) {
+          return nativeConfirm.apply(this, arguments);
+        }
+        var ramki = Array.prototype.slice.call(doc.querySelectorAll('iframe.dawkomat-frame')).filter(milczy);
+        if (!ramki.length) {
+          console.log('[serum-ui] Dawkomat: fałszywy alarm (wszystkie ramki odpowiedziały) — Anuluj');
+          return false;
+        }
+        var nowe = ramki.filter(function (f) { return !ponowione.has(f); });
+        if (!nowe.length) return nativeConfirm.apply(this, arguments);
+        nowe.forEach(function (f) {
+          ponowione.add(f);
+          console.log('[serum-ui] Dawkomat: ramka milczy 15 s — przeładowuję');
+          f.src = f.src;
+        });
+        var self = this;
+        win.setTimeout(function () {
+          var wciaz = nowe.filter(function (f) { return f.isConnected && milczy(f); });
+          if (!wciaz.length) return;
+          console.log('[serum-ui] Dawkomat: nadal milczy po przeładowaniu');
+          if (nativeConfirm.call(self, msg)) wciaz.forEach(naStandard);
+        }, 20000);
+        return false;
+      };
+    }
+
+    function patch(win) {
+      if (!win || win[KEY]) return;
+      win[KEY] = true;
+      var nativeAlert = win.alert.bind(win);
+      var nativeConfirm = win.confirm.bind(win);
+      win.alert = function (msg) {
+        if (handleAlert(msg)) return undefined;
+        return nativeAlert.apply(this, arguments);
+      };
+      win.confirm = function (msg) {
+        var answer = handleConfirm(msg);
+        if (answer !== null) return answer;
+        return nativeConfirm.apply(this, arguments);
+      };
+      // Po naszej łatce, żeby Dawkomat owijał już ją, a nie gołe okno.
+      dawkomat(win);
+    }
+
+    var widziane = new WeakSet();
+    function ramka(f) {
+      if (widziane.has(f)) return;
+      widziane.add(f);
+      try { patch(f.contentWindow); } catch (e) {}
+      // Każda nawigacja ramki to nowe okno bez łatki.
+      f.addEventListener('load', function () { try { patch(f.contentWindow); } catch (e) {} });
+    }
+    function skanuj(root) {
+      if (root.nodeName === 'IFRAME' || root.nodeName === 'FRAME') ramka(root);
+      if (!root.firstElementChild) return;
+      var n = root.querySelectorAll('iframe, frame');
+      for (var i = 0; i < n.length; i++) ramka(n[i]);
+    }
+
+    patch(window);
+    skanuj(document);
+    // Jeden obserwator ramek dla obu łatek (wcześniej dwa osobne).
+    new MutationObserver(function (rs) {
+      for (var i = 0; i < rs.length; i++) {
+        var a = rs[i].addedNodes;
+        for (var j = 0; j < a.length; j++) if (a[j].nodeType === 1) skanuj(a[j]);
+      }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  wstrzyknijDoStrony(dialogiStrony);
 
   // =====================================================================
   // MODUŁ: przekierowanie z błędu 404 (dawniej serum-redirect-404.user.js)
@@ -1335,16 +1225,7 @@
     };
   }
 
-  (function wstrzyknijPodsluchEzla() {
-    function inject() {
-      const el = document.createElement('script');
-      el.textContent = '(' + podsluchEzlaXhr + ')();';
-      (document.documentElement || document.head || document).appendChild(el);
-      el.remove();
-    }
-    if (document.documentElement) inject();
-    else document.addEventListener('DOMContentLoaded', inject, { once: true });
-  })();
+  wstrzyknijDoStrony(podsluchEzlaXhr);
 
   // Gdyby po zalogowaniu kolejne zapytania wciąż dostawały BLAD_SESJI, skrypt
   // nie kręci pętli PIN-ów: po tylu logowaniach z rzędu bez udanego pobrania
@@ -1831,9 +1712,8 @@
   }
 
   function bootSmsToast() {
-    // Ten skrypt nie ma @grant unsafeWindow, więc działa w piaskownicy —
-    // nadpisanie tu window.alert nie widzi prawdziwych alertów strony.
-    // Zdarzenie „serum-sms-sent” zgłasza serum-dialogs.user.js (ma dostęp do realnego okna).
+    // Zdarzenie „serum-sms-sent” zgłasza moduł dialogów (dialogiStrony,
+    // kontekst strony) po przechwyceniu „Wysłano sms o treści…”.
     document.addEventListener('serum-sms-sent', showSmsToast, false);
   }
 
