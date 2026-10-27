@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.118.0
+// @version      3.119.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.118.0';
+  const SCRIPT_VERSION = '3.119.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -387,6 +387,15 @@
     if (el.style[prop] !== value) el.style[prop] = value;
   }
 
+  // Wszystkie elementy o danym id — Serum zostawia w DOM stare kopie okien
+  // z tym samym id, a getElementById zwraca tylko pierwszą. Ale getElementById
+  // to O(1): null znaczy, że nie ma ANI JEDNEJ kopii, więc pełny przelot
+  // dokumentu selektorem [id="…"] (~0,45 ms na tick, log 28.09) robimy tylko
+  // wtedy, gdy któraś istnieje.
+  function wszystkieZId(id) {
+    return document.getElementById(id) ? [...document.querySelectorAll('[id="' + id + '"]')] : [];
+  }
+
   // Log przeżywa przeładowanie strony (sessionStorage). Dotąd był wyłącznie
   // w pamięci, więc każde przeładowanie Serum kasowało historię — a właśnie
   // wtedy log „kończył się wcześniej” i nie było w nim bieżących zdarzeń.
@@ -538,202 +547,37 @@
 
   // --- WYNIKI OPERACJI ---
 
-  const WYNIKI_TITLES = ['wyniki operacji', 'wynik operacji'];
-  // Stałe, potwierdzone identyfikatory kontenera tego okna — Serum używa co
-  // najmniej dwóch: #ereferralFrame (skierowania) i #operationResultsPopup
-  // (recepty/e-recepty, potwierdzone zrzutem ekranu z inspektora). Oba mają
-  // ten sam problem z osadzonym podglądem PDF (patrz isWynikiContainer).
-  const WYNIKI_KNOWN_IDS = ['ereferralFrame', 'operationResultsPopup'];
-  const wynikiGateLogged = new WeakSet();
+  // Okno siedzi zawsze w jednym z dwóch stałych kontenerów Serum, pokazywanych
+  // klasą „show”. Logi 08–28.09.2026 (10 plików): 153 z 153 zamknięć poszło
+  // pierwszym klikiem w button.popup-close kontenera, nagłówek .popup-header h1
+  // to zawsze „Wyniki operacji”. W #ereferralFrame bywa też „Wydruk
+  // potwierdzenia wysłania skierowania” — to obsługuje podgląd wydruku.
+  // Dawne szukanie nagłówka po tekście i wspinaczka po przodkach aż do <body>
+  // (tekst body: 9–10,5 mln znaków) kosztowały 200–630 ms przy KAŻDYM
+  // pojawieniu się okna (15–31 „DŁUGI TICK” dziennie).
+  const WYNIKI_KONTENERY = ['operationResultsPopup', 'ereferralFrame'];
+  const WYNIKI_TYTUL_RE = /wyniki? operacji/i;
 
-  // Zamiast WeakSet po tożsamości węzła DOM: potwierdzone logiem diagnostyki
-  // bramki (dwa wystąpienia z rzędu, ta sama treść/rozmiar #ereferralFrame) —
-  // Serum PONOWNIE WYKORZYSTUJE ten sam kontener dla KOLEJNYCH, różnych
-  // skierowań (podmienia tylko treść i przełącza klasę „show”). WeakSet po
-  // węźle raz oznaczał go jako „zamknięty na zawsze” po pierwszym sukcesie —
-  // dla następnego, innego skierowania w TYM SAMYM węźle funkcja ucinała się
-  // cichym returnem na samym starcie, bez jakiegokolwiek śladu w logu. Zamiast
-  // tożsamości węzła śledzimy SYGNATURĘ konkretnego wystąpienia (numer
-  // skierowania + fragment treści) — nowe skierowanie = nowa sygnatura = próba
-  // od nowa, nawet jeśli to fizycznie ten sam węzeł DOM.
-  let wynikiHandledSignature = null;
-
-  function wynikiSignature(root) {
-    // „Identyfikator pakietu” to unikalny numer generowany przez Serum przy
-    // KAŻDYM wystąpieniu tego okna (potwierdzone logiem: przy receptach
-    // referralId_main zostaje puste/nieaktualne, a pierwsze 80 znaków tekstu
-    // jest IDENTYCZNE w każdym oknie recept — przez co druga i kolejne
-    // recepty w tej samej sesji dostawały tę samą sygnaturę co pierwsza i
-    // były trwale, cicho pomijane). Identyfikator pakietu różni się za
-    // każdym razem, więc jest jedynym pewnym kluczem.
-    const text = root.textContent || '';
-    const pakiet = text.match(/identyfikator\s*pakietu\D*(\d+)/i);
-    if (pakiet) return 'pakiet:' + pakiet[1];
-    const referralId = document.querySelector('input.referralId_main')?.value || '';
-    return referralId + '|' + normLabel(text).slice(0, 80);
-  }
-
-  function findWynikiTitleNode() {
-    // Serum zostawia w DOM ukryte, stare kopie już zamkniętych okien WYNIKI
-    // OPERACJI — bez filtra widoczności ta funkcja potrafiła złapać martwy
-    // nagłówek sprzed poprzedniego zamknięcia (wcześniejszy w kolejności DOM
-    // niż ten aktualnie widoczny), przez co cała reszta próbowała zamykać
-    // niewłaściwe/niewidoczne okno, a to widoczne zostawało otwarte.
-    // Gdy widoczny jest znany kontener tego okna (#operationResultsPopup dla
-    // recept, #ereferralFrame dla skierowań — oba potwierdzone inspektorem),
-    // szukamy nagłówka WYŁĄCZNIE w nim. Bez tego zawężenia przeszukiwane były
-    // WSZYSTKIE h1/h2/h3/span/div/label/th/td w całym dokumencie, przy każdym
-    // ticku od pojawienia się okna aż do jego zamknięcia. Gdy żadnego znanego
-    // kontenera nie ma (nieznany jeszcze wariant okna), wracamy do skanu
-    // całego dokumentu — czyli zachowania sprzed tej zmiany.
-    const scopes = [];
-    for (const id of WYNIKI_KNOWN_IDS) {
-      const frame = document.getElementById(id);
-      if (frame?.classList.contains('show')) scopes.push(frame);
-    }
-    if (!scopes.length) scopes.push(document);
-
-    for (const scope of scopes) {
-      for (const node of scope.querySelectorAll('h1, h2, h3, span, div, label, th, td')) {
-        const raw = normLabel(node.textContent);
-        if (raw.length > 40 || raw.length < 12) continue;
-        const lower = raw.toLowerCase();
-        if (WYNIKI_TITLES.some((t) => lower.includes(t)) && isOverlayElementVisible(node)) return node;
-      }
+  // Przez wspólną listę pokazanych popupów (żywa lista klas) — strona jest
+  // w trybie quirks (doctype HTML 4.0 bez adresu), a tam querySelector('#id')
+  // nie korzysta z indeksu id i przechodzi cały dokument.
+  function findWynikiFrame() {
+    for (const frame of pokazanePopupy()) {
+      if (!WYNIKI_KONTENERY.includes(frame.id)) continue;
+      const h1 = frame.querySelector('.popup-header h1');
+      if (h1 && WYNIKI_TYTUL_RE.test(h1.textContent)) return frame;
     }
     return null;
   }
 
-  function findEnabledByClass(scope, selector) {
-    const el = [...scope.querySelectorAll(selector)].find((btn) => isOverlayElementVisible(btn) && !btn.disabled);
-    return el || null;
-  }
-
-  function findWynikiCloseCandidates(root) {
-    // Niektóre warianty tego okna (np. skierowanie z wbudowanym podglądem
-    // wydruku) mają WIĘCEJ NIŻ JEDEN element pasujący do "przycisku
-    // zamknięcia" — np. osobny dla samego podglądu wydruku i osobny dla
-    // całego okna WYNIKI OPERACJI. Kliknięcie niewłaściwego z nich potrafi
-    // nie zamknąć okna wcale. Dlatego zwracamy WSZYSTKICH kandydatów w
-    // kolejności prawdopodobieństwa, żeby dało się spróbować po kolei i
-    // sprawdzić, który faktycznie zamyka.
-    const seen = new Set();
-    const candidates = [];
-    const add = (el) => {
-      if (el && !seen.has(el)) {
-        seen.add(el);
-        candidates.push(el);
-      }
-    };
-
-    // Najpewniejszy sygnał: natywna klasa Serum dla przycisku zamykania
-    // (analogicznie do „x-buttonSign” przy podpisywaniu e-recepty) — dużo
-    // pewniejsza niż dopasowanie po samym tekście „Zamknij”, bo bywa kilka
-    // elementów z tym tekstem (np. „Zapisz i zamknij”), z których tylko
-    // jeden jest tym prawdziwym zamknięciem okna wyników.
-    // Wariant „popup-window” (np. div#ereferralFrame, ten sam komponent co
-    // podgląd wydruku skierowania) ma własny krzyżyk button.popup-close BEZ
-    // tekstu (× to tło CSS) — bez tej klasy w selektorze kod łapał zamiast
-    // niego wewnętrzny przycisk „Zamknij” należący do osadzonego podglądu
-    // wydruku, który zamykał tylko podgląd, a nie cały popup z wynikami.
-    const CLOSE_CLASS_SEL = 'button.popup-close, a.popup-close, button.x-buttonClose, a.x-buttonClose, input.x-buttonClose';
-    [...root.querySelectorAll(CLOSE_CLASS_SEL)]
-      .filter((btn) => isOverlayElementVisible(btn) && !btn.disabled)
-      .forEach(add);
-    [...document.querySelectorAll(CLOSE_CLASS_SEL)]
-      .filter((btn) => isOverlayElementVisible(btn) && !btn.disabled)
-      .forEach(add);
-
-    // Przycisk tekstowy „Zamknij” — bywają DWA w tym samym panelu (u góry i
-    // na dole); realnie podłączony do właściwej akcji okazał się zwykle ten
-    // na DOLE, więc próbujemy od najniższego.
-    const zamknijBtns = [...root.querySelectorAll('button, input[type="button"], a')].filter(
-      (btn) => isOverlayElementVisible(btn) && normLabel(btn.textContent || btn.value) === 'Zamknij'
-    );
-    zamknijBtns.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
-    zamknijBtns.forEach(add);
-
-    // Generyczna ikonka „×” w rogu okna — ostatni fallback, bywa że tylko
-    // wizualnie ukrywa okno bez wywołania właściwej akcji.
-    for (const btn of root.querySelectorAll('button, a, span, div, i')) {
-      const rect = btn.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0 || rect.width > 40 || rect.height > 40) continue;
-      const t = (btn.textContent || '').trim();
-      if (t !== '×' && t !== '✕' && t !== 'X') continue;
-      add(btn);
-    }
-
-    return candidates;
-  }
-
-  function findWynikiClose(root) {
-    return findWynikiCloseCandidates(root)[0] || null;
-  }
-
-  function isWynikiContainer(el, titleRect) {
-    const content = el.textContent || '';
-    const lower = normalize(content);
-    if (!WYNIKI_TITLES.some((t) => lower.includes(t))) return false;
-    if (lower.includes('weryfikacja negatywna')) return false;
-
-    // Zwykle rozpoznajemy to okno po tekście „weryfikacja pozytywna” w treści
-    // kontenera. Wariant „z ostrzeżeniami” z osadzonym podglądem PDF
-    // skierowania potrafi jednak mieć ten fragment w części DOM, do której
-    // .textContent z niejasnego powodu (prawdopodobnie sposób renderowania
-    // wbudowanego podglądu PDF — w konsoli widać wtedy błąd bezpieczeństwa o
-    // treści spod file:///) nie dociera — wtedy CAŁA funkcja modWynikiOperacji
-    // milczała (nawet bramka wyżej ją blokowała) i okno nigdy się nie
-    // zamykało, bez śladu w logu. WYNIKI_KNOWN_IDS to stałe, potwierdzone
-    // identyfikatory kontenerów TEGO okna (patrz komentarze w start()) —
-    // traktujemy je jako wystarczający dowód same w sobie, niezależnie od
-    // tego, czy tekst „weryfikacja pozytywna” faktycznie widać w .textContent.
-    const isKnownFrame = WYNIKI_KNOWN_IDS.includes(el.id);
-    if (!isKnownFrame && !lower.includes('weryfikacja pozytywna')) return false;
-    if (!isKnownFrame && !lower.includes('wynik weryfikacji') && !lower.includes('identyfikator pakietu')) return false;
-    // Próg podniesiony z 20000 — wariant „Skierowanie - weryfikacja pozytywna
-    // z ostrzeżeniami” z wbudowanym podglądem wydruku (embed PDF) potrafi mieć
-    // kilkadziesiąt tysięcy znaków tekstu i przy progu 20000 był odrzucany w
-    // każdej iteracji pętli w findWynikiModal, przez co całe okno nigdy się
-    // nie zamykało. Ochronę przed dopasowaniem zbyt szerokiego przodka i tak
-    // daje głównie wybór NAJMNIEJSZEGO obszaru (bestArea) w findWynikiModal —
-    // ten limit to tylko dodatkowy bezpiecznik przeciw np. całemu <body>.
-    if (content.length > 200000) return false;
-    if (lower.includes('podgląd pakietów recept') && content.length > 8000) return false;
-
-    // Nagłówek „WYNIKI OPERACJI” musi być przy górnej krawędzi TEGO kontenera —
-    // inaczej to jest za duży przodek (np. cały panel edycji wizyty), a nie sam popup.
-    // Nie sprawdzamy tu rozmiaru kontenera — niektóre popupy mają zdegenerowaną
-    // (0px/kilkupikselową) wysokość mimo że wizualnie zajmują cały ekran.
-    if (titleRect) {
-      const rect = el.getBoundingClientRect();
-      if (titleRect.top - rect.top > 60) return false;
-    }
-
-    return !!findWynikiClose(el);
-  }
-
-  function findWynikiModal() {
-    const titleNode = findWynikiTitleNode();
-    if (!titleNode) return null;
-    const titleRect = titleNode.getBoundingClientRect();
-
-    let best = null;
-    let bestArea = Infinity;
-    let el = titleNode;
-
-    for (let i = 0; i < 20 && el; i++) {
-      if (isWynikiContainer(el, titleRect)) {
-        const rect = el.getBoundingClientRect();
-        const area = rect.width * rect.height;
-        if (area < bestArea) {
-          bestArea = area;
-          best = { root: el, close: findWynikiClose(el) };
-        }
-      }
-      el = el.parentElement;
-    }
-
-    return best;
+  // „Identyfikator pakietu” jest inny przy każdym wystąpieniu okna recept
+  // (potwierdzone logiem). Skierowania go nie mają — tam numer skierowania
+  // + początek treści.
+  function wynikiSignature(text) {
+    const pakiet = text.match(/identyfikator\s*pakietu\D*(\d+)/i);
+    if (pakiet) return 'pakiet:' + pakiet[1];
+    const referralId = document.querySelector('input.referralId_main')?.value || '';
+    return referralId + '|' + normLabel(text).slice(0, 80);
   }
 
   // Zamknięcie tego okna zwykle uruchamia w Serum odświeżenie leżącej pod spodem
@@ -742,220 +586,80 @@
   // dlatego dajemy chwilę zwłoki zanim faktycznie klikniemy zamknięcie.
   const WYNIKI_CLOSE_DELAY_MS = 500;
 
-  let wynikiNotFoundLogged = false;
+  let wynikiHandledSignature = null;
+  let wynikiNegatywnaFrame = null;
 
   function modWynikiOperacji() {
-    // CAŁA funkcja w try/catch z NIETŁUMIONYM logowaniem wyjątku (w
-    // przeciwieństwie do uiTick(), który loguje ten sam komunikat wyjątku
-    // tylko RAZ na całą sesję strony — więc gdyby to był realny wyjątek
-    // rzucany tu na każdym ticku, po pierwszym zalogowaniu i tak zniknąłby
-    // z logu, choć problem trwałby dalej). To zamyka ostatnią lukę, przez
-    // którą to okno mogło milczeć całkowicie mimo działającego uiTick().
-    try {
-      // Tania bramka na wypadek każdego ticka — ale nie może polegać WYŁĄCZNIE
-      // na tekście, bo wariant „z ostrzeżeniami” (patrz isWynikiContainer) go
-      // czasem nie ma w .textContent mimo że okno jest widoczne. WYNIKI_KNOWN_IDS
-      // to znane, stałe identyfikatory tego okna — ich obecność sama w sobie
-      // wystarcza, żeby przejść do właściwego wyszukiwania.
-      const knownFrame = document.querySelector(
-        WYNIKI_KNOWN_IDS.map((id) => '#' + id + '.popup-window.show').join(', ')
-      );
-      const hasKnownFrame = !!knownFrame;
-      if (!hasKnownFrame && !getBodyTextLower().includes('weryfikacja pozytywna')) {
-        wynikiNotFoundLogged = false;
-        return;
-      }
-
-      // Surowa diagnostyka bramki — RAZ na każde pojawienie się tego
-      // konkretnego elementu (klucz to sam element, nie czas), zanim
-      // findWynikiModal/isWynikiContainer zdąży cokolwiek odfiltrować. Ma
-      // wyłapać przypadek, w którym bramka przechodzi, ale cała reszta
-      // funkcji i tak nie zostawia żadnego śladu w logu.
-      if (hasKnownFrame && !wynikiGateLogged.has(knownFrame)) {
-        wynikiGateLogged.add(knownFrame);
-        const h1 = knownFrame.querySelector('.popup-header h1');
-        const rawTitleMatches = [...knownFrame.querySelectorAll('h1, h2, h3, span, div, label, th, td')].filter((n) => {
-          const lower = normalize(n.textContent || '');
-          return WYNIKI_TITLES.some((t) => lower.includes(t));
-        });
-        const frameRect = knownFrame.getBoundingClientRect();
-        dbg(
-          'modWynikiOperacji: (diagnostyka bramki) #' + knownFrame.id + '.show wykryty — ' +
-            'h1="' + normLabel(h1?.textContent || '').slice(0, 40) + '"' +
-            ' rect=' + Math.round(frameRect.width) + 'x' + Math.round(frameRect.height) +
-            ' surowych_dopasowań_tytułu=' + rawTitleMatches.length +
-            ' ma_close=' + !!findWynikiClose(knownFrame)
-        );
-      }
-
-      const modal = findWynikiModal();
-      if (!modal) {
-      // Diagnostyka: strona zawiera "weryfikacja pozytywna", ale żaden
-      // przodek nagłówka WYNIKI OPERACJI nie przeszedł isWynikiContainer —
-      // logujemy raz na wystąpienie, żeby nie zgadywać przy kolejnym takim
-      // niedopasowanym przypadku (np. skierowanie z wbudowanym podglądem
-      // wydruku, które ma nietypowo dużo treści w kontenerze).
-      if (!wynikiNotFoundLogged) {
-        wynikiNotFoundLogged = true;
-        const titleNode = findWynikiTitleNode();
-        if (!titleNode) {
-          dbg('modWynikiOperacji: (diagnostyka) brak nagłówka WYNIKI OPERACJI mimo "weryfikacja pozytywna" na stronie');
-        } else {
-          const info = [];
-          let el = titleNode;
-          for (let i = 0; i < 20 && el; i++) {
-            const lower = normalize(el.textContent || '');
-            info.push(
-              'głęb.' + i + ' dł.=' + (el.textContent || '').length +
-              ' weryf.pozyt=' + lower.includes('weryfikacja pozytywna') +
-              ' weryf.negat=' + lower.includes('weryfikacja negatywna') +
-              ' wynik_weryf/id_pakietu=' + (lower.includes('wynik weryfikacji') || lower.includes('identyfikator pakietu')) +
-              ' podglad_pakietow=' + lower.includes('podgląd pakietów recept') +
-              ' ma_close=' + !!findWynikiClose(el)
-            );
-            el = el.parentElement;
-          }
-          dbg('modWynikiOperacji: (diagnostyka) nie znaleziono kontenera mimo "weryfikacja pozytywna":\n' + info.join('\n'));
-        }
-      }
+    const frame = findWynikiFrame();
+    if (!frame) {
+      wynikiHandledSignature = null;
+      wynikiNegatywnaFrame = null;
       return;
     }
-    // Kontener się znalazł — odblokuj diagnostykę "nie znaleziono" na
-    // wypadek kolejnego, innego okna później w tej samej sesji strony
-    // (bez tego flaga zatrzaskiwała się raz i milczała już do końca,
-    // nawet gdy w międzyczasie inne okna WYNIKI OPERACJI działały poprawnie).
-    wynikiNotFoundLogged = false;
-    const signature = wynikiSignature(modal.root);
-    if (wynikiHandledSignature === signature) return;
 
+    const text = frame.textContent || '';
+    // Weryfikacja negatywna (także częściowo, przy kilku receptach) zostaje na
+    // ekranie do przeczytania — 21 takich okien w logach.
+    if (normalize(text).includes('weryfikacja negatywna')) {
+      if (wynikiNegatywnaFrame !== frame) dbg('modWynikiOperacji: weryfikacja negatywna — zostawiam okno #' + frame.id);
+      wynikiNegatywnaFrame = frame;
+      return;
+    }
+
+    const signature = wynikiSignature(text);
+    if (wynikiHandledSignature === signature) return;
     wynikiHandledSignature = signature;
-    const rect = modal.root.getBoundingClientRect();
-    const closeRect = modal.close.getBoundingClientRect();
-    dbg('modWynikiOperacji: zaplanowano klik zamknij za ' + WYNIKI_CLOSE_DELAY_MS + 'ms, root=' + modal.root.tagName +
-      ' rect=' + Math.round(rect.width) + 'x' + Math.round(rect.height) +
-      ' text="' + normLabel(modal.root.textContent).slice(0, 80) + '"' +
-      ' | przycisk=' + modal.close.tagName + '.' + modal.close.className + ' text="' + normLabel(modal.close.textContent || modal.close.value).slice(0, 20) +
-      '" top=' + Math.round(closeRect.top));
+    dbg('modWynikiOperacji: #' + frame.id + ' — klik krzyżyka za ' + WYNIKI_CLOSE_DELAY_MS + 'ms');
+
+    const ponow = (powod) => {
+      dbg('modWynikiOperacji: ' + powod + ' — ponowię');
+      if (wynikiHandledSignature === signature) wynikiHandledSignature = null;
+      scheduleUi();
+    };
 
     setTimeout(async () => {
-      if (!modal.root.isConnected) return;
-
-      // CAŁOŚĆ w try/catch + zerowanie wynikiHandledSignature przy każdej
-      // porażce: sygnatura zostaje zapisana OD RAZU przy planowaniu (wyżej),
-      // żeby kolejne uiTick() (lecą co < 1s) nie planowały drugiego,
-      // równoległego zamykania tego samego okna. Ale jeśli TA próba się nie
-      // powiedzie — żaden kandydat nie zamknął okna, albo coś rzuciło wyjątek
-      // w trakcie — bez wyzerowania sygnatury okno zostawało oznaczone jako
-      // "obsłużone" NA ZAWSZE i nigdy więcej nie było próbowane, mimo że
-      // uiTick() dalej działał normalnie. To był realny przypadek: okno z
-      // "weryfikacją z ostrzeżeniami" (osadzony podgląd PDF) potrafi między
-      // zaplanowaniem a wykonaniem (500ms) doładować dodatkowe elementy
-      // pasujące do selektora "przycisk zamknięcia", więc próba 1 z kilku
-      // kandydatów czasem trafia w zły element. Zerujemy tylko, jeśli sygnatura
-      // wciąż wskazuje NA TĘ próbę (żeby nie skasować już nowszej, innej).
       try {
-        const candidates = findWynikiCloseCandidates(modal.root).filter((btn) => isOverlayElementVisible(btn));
-        if (!candidates.length) {
-          dbg('modWynikiOperacji: brak widocznego przycisku zamknięcia w chwili próby — ponowię przy kolejnym ticku');
-          if (wynikiHandledSignature === signature) wynikiHandledSignature = null;
+        if (!frame.classList.contains('show')) return; // zamknięte w międzyczasie
+        const btn = [...frame.querySelectorAll('button.popup-close')].find((b) => !b.disabled && isOverlayElementVisible(b));
+        if (!btn) { ponow('brak widocznego button.popup-close'); return; }
+        btn.click();
+        await sleepMs(300);
+        if (!frame.isConnected || !frame.classList.contains('show') || !isOverlayElementVisible(frame)) {
+          dbg('modWynikiOperacji: zamknięto');
           return;
         }
-
-        for (let i = 0; i < candidates.length; i++) {
-          const btn = candidates[i];
-          if (!isOverlayElementVisible(btn)) continue;
-          dbg(
-            'modWynikiOperacji: klik zamknij (próba ' + (i + 1) + '/' + candidates.length + ') ' +
-              btn.tagName + '.' + btn.className + ' text="' + normLabel(btn.textContent || btn.value).slice(0, 20) + '"'
-          );
-          try {
-            btn.click();
-          } catch (e) {
-            dbg('modWynikiOperacji: wyjątek przy kliku kandydata ' + (i + 1) + ' — ' + (e?.message || e));
-            continue;
-          }
-          await sleepMs(300);
-          if (!modal.root.isConnected || !isOverlayElementVisible(modal.root)) {
-            dbg('modWynikiOperacji: zamknięto (próba ' + (i + 1) + ')');
-            return;
-          }
-        }
-
-        dbg('modWynikiOperacji: żadna z ' + candidates.length + ' prób nie zamknęła okna — ponowię przy kolejnym ticku');
-        if (wynikiHandledSignature === signature) wynikiHandledSignature = null;
+        ponow('klik krzyżyka nie zamknął okna');
       } catch (e) {
-        dbg('modWynikiOperacji: wyjątek w próbie zamknięcia — ' + (e?.message || e) + ' — ponowię przy kolejnym ticku');
-        if (wynikiHandledSignature === signature) wynikiHandledSignature = null;
+        ponow('wyjątek ' + (e?.message || e));
       }
     }, WYNIKI_CLOSE_DELAY_MS);
-    } catch (e) {
-      // Nietłumione — w przeciwieństwie do uiTick() logujemy KAŻDE
-      // wystąpienie, nawet identyczne w kółko, bo to jedyny sposób, żeby
-      // zauważyć wyjątek powtarzający się na każdym ticku (który uiTick()
-      // zalogowałby tylko raz na sesję i dalej milczał).
-      dbg('modWynikiOperacji: NIEOCZEKIWANY WYJĄTEK — ' + (e?.message || e) +
-        (e?.stack ? ' | ' + String(e.stack).split('\n').slice(0, 3).join(' <- ') : ''));
-    }
   }
-
   // --- WYŚLIJ SMS ---
 
-  const SMS_TITLE = 'WYSYŁKA SMS KODÓW DOSTĘPOWYCH EDOKUMENTÓW';
   let smsClicked = false;
 
   // Potwierdzone inspektorem:
   //   <span id="wysylkaSmsKodowDostepowychEdokumentow" class="h3_tytul">…</span>
   //   <a id="edokumenty_sms_wyslij" class="a_akc" href="#">Wyślij SMS</a>
-  // Przycisk ma własne, stałe id, więc szukanie okna po tytule i przemiatanie
-  // jego wnętrza w poszukiwaniu przycisku o tekście „Wyślij SMS” jest zbędne.
+  // Dawna bramka po tekście całego <body> (serializacja ~10 mln znaków)
+  // i ścieżka awaryjna po tytule okna — usunięte, id wystarczają.
   const SMS_TITLE_ID = 'wysylkaSmsKodowDostepowychEdokumentow';
   const SMS_BUTTON_ID = 'edokumenty_sms_wyslij';
 
-  function findSmsWindowRoot() {
-    // Awaryjnie (gdyby id zniknęło) — dawna ścieżka po tytule okna.
-    const target = SMS_TITLE.toLowerCase();
-    for (const node of document.querySelectorAll('span.h3_tytul, div, h1, h2, h3, label')) {
-      const raw = normLabel(node.textContent);
-      if (!raw.toLowerCase().includes(target)) continue;
-      if (raw.length > SMS_TITLE.length + 120) continue;
-      return node.closest('div, table, form, fieldset') || node.parentElement;
-    }
-    return null;
-  }
-
-  function findSmsWyslijButton() {
-    const byId = document.getElementById(SMS_BUTTON_ID);
-    if (byId) return isOverlayElementVisible(byId) ? byId : null;
-
-    const root = findSmsWindowRoot();
-    if (!root) return null;
-    for (const el of root.querySelectorAll('button, input[type="button"], input[type="submit"], a')) {
-      if (normLabel(el.textContent || el.value) !== 'Wyślij SMS') continue;
-      if (!isOverlayElementVisible(el)) continue;
-      return el;
-    }
-    return null;
-  }
-
   function modWyslijSms() {
-    // Bramka po ID nagłówka okna zamiast szukania jego tytułu w tekście CAŁEJ
-    // strony — getElementById jest nieporównanie tańsze niż przeszukiwanie
-    // zserializowanego tekstu <body>.
-    const titleEl = document.getElementById(SMS_TITLE_ID);
-    if (!titleEl && !getBodyTextLower().includes(SMS_TITLE.toLowerCase())) {
+    if (!document.getElementById(SMS_TITLE_ID)) {
       smsClicked = false;
       return;
     }
     if (smsClicked) return;
 
-    const btn = findSmsWyslijButton();
-    if (!btn) return;
+    const btn = document.getElementById(SMS_BUTTON_ID);
+    if (!isOverlayElementVisible(btn)) return;
 
     smsClicked = true;
     dbg('modWyslijSms: klik Wyślij SMS');
     btn.click();
   }
-
   // --- PODPISZ E-RECEPTĘ (PIN wpisany → klik „Podpisz”) ---
 
   let ereceptSigned = false;
@@ -993,7 +697,7 @@
     let panel = pin.parentElement;
     for (let depth = 0; depth < 12 && panel; depth++) {
       const signBtn = [...panel.querySelectorAll('button.x-buttonSign, button, a, input[type="button"], input[type="submit"]')].find(
-        (el) => isOverlayElementVisible(el) && normLabel(el.textContent || el.value) === 'Podpisz'
+        (el) => normLabel(el.textContent || el.value) === 'Podpisz' && isOverlayElementVisible(el)
       );
       if (signBtn) return signBtn;
       panel = panel.parentElement;
@@ -1369,7 +1073,7 @@
     let panel = pin.parentElement;
     for (let depth = 0; depth < 12 && panel; depth++) {
       const btn = [...panel.querySelectorAll('button, input[type="button"], input[type="submit"], a')].find(
-        (el) => isOverlayElementVisible(el) && normLabel(el.textContent || el.value) === 'Zaloguj'
+        (el) => normLabel(el.textContent || el.value) === 'Zaloguj' && isOverlayElementVisible(el)
       );
       if (btn) {
         dbg('eZLA: PIN wpisany, klik Zaloguj');
@@ -1465,7 +1169,7 @@
   function findEzlaPodpisPin() {
     // Strona potrafi zdublować ten wiersz (dwa nałożone okienka PIN w DOM) —
     // bierzemy pierwszy faktycznie widoczny.
-    for (const el of document.querySelectorAll('[id="inp_ezla_podpis_pin"]')) {
+    for (const el of wszystkieZId('inp_ezla_podpis_pin')) {
       if (isOverlayElementVisible(el)) return el;
     }
     return null;
@@ -1475,7 +1179,7 @@
     let panel = pin.parentElement;
     for (let depth = 0; depth < 12 && panel; depth++) {
       const btn = [...panel.querySelectorAll('a, button, input[type="button"], input[type="submit"]')].find(
-        (el) => isOverlayElementVisible(el) && normLabel(el.textContent || el.value) === 'Podpisz i wyślij do ZUS'
+        (el) => normLabel(el.textContent || el.value) === 'Podpisz i wyślij do ZUS' && isOverlayElementVisible(el)
       );
       if (btn) return btn;
       panel = panel.parentElement;
@@ -1521,38 +1225,37 @@
   // id="a_akc" onclick="uf_schowaj_div();f_ezla_nadajserienr(...)">Wyślij</a>).
   // Inne, nieznane jeszcze warianty „OSTRZEŻENIE” mogą wymagać realnej
   // decyzji użytkownika, więc lepiej ich nie dotykać.
+  // Kolejność: najpierw link (selektor po onclick), a tekst strony dopiero,
+  // gdy widoczny link istnieje — dawniej tekst całego <body> był bramką
+  // na KAŻDYM ticku.
   const EZLA_OSTRZEZENIE_TEXT = 'przerwa między zwolnieniami';
   let ezlaOstrzezenieClicked = false;
 
   function findEzlaOstrzezenieWyslij() {
-    for (const el of document.querySelectorAll('a, button')) {
-      if (!isOverlayElementVisible(el)) continue;
+    for (const el of document.querySelectorAll('[onclick*="f_ezla_nadajserienr"]')) {
+      if (el.tagName !== 'A' && el.tagName !== 'BUTTON') continue;
       if (normLabel(el.textContent) !== 'Wyślij') continue;
-      const onclick = el.getAttribute('onclick') || '';
-      if (!onclick.includes('f_ezla_nadajserienr')) continue;
+      if (!isOverlayElementVisible(el)) continue;
       return el;
     }
     return null;
   }
 
   function modEzlaOstrzezenieWyslij() {
-    if (!getBodyTextLower().includes(EZLA_OSTRZEZENIE_TEXT)) {
+    const btn = findEzlaOstrzezenieWyslij();
+    if (!btn) {
       ezlaOstrzezenieClicked = false;
       return;
     }
     if (ezlaOstrzezenieClicked) return;
-
-    const btn = findEzlaOstrzezenieWyslij();
-    if (!btn) return;
-
     ezlaOstrzezenieClicked = true;
+    if (!(document.body.textContent || '').toLowerCase().includes(EZLA_OSTRZEZENIE_TEXT)) return;
+
     dbg('modEzlaOstrzezenieWyslij: klik Wyślij (OSTRZEŻENIE — przerwa między zwolnieniami)');
     btn.click();
   }
-
   // --- POWÓD EDYCJI (auto „X” + Zapisz) ---
 
-  const POWOD_EDYCJI_TITLE = 'POWÓD EDYCJI';
   const POWOD_EDYCJI_LABEL = 'Powód edycji';
   const POWOD_EDYCJI_VALUE = 'X';
   let powodEdycjiDone = false;
@@ -1565,22 +1268,8 @@
   // div/span/h1..td wystarczy getElementById i wspięcie się do kontenera okna.
   const POWOD_EDYCJI_TITLE_ID = 'powodEdycji';
 
-  function findPowodEdycjiRoot() {
-    const titleEl = document.getElementById(POWOD_EDYCJI_TITLE_ID);
-    if (titleEl) {
-      const win = titleEl.closest('.przegladarka') || titleEl.closest('div, table, form, fieldset');
-      if (win) return win;
-    }
-
-    // Ścieżka awaryjna — dawne dopasowanie po tytule.
-    const target = POWOD_EDYCJI_TITLE.toLowerCase();
-    for (const node of document.querySelectorAll('span.h3_tytul, div, h1, h2, h3, label, td')) {
-      const raw = normLabel(node.textContent);
-      if (!raw.toLowerCase().includes(target)) continue;
-      if (raw.length > POWOD_EDYCJI_TITLE.length + 120) continue;
-      return node.closest('div, table, form, fieldset') || node.parentElement;
-    }
-    return null;
+  function findPowodEdycjiRoot(titleEl) {
+    return titleEl.closest('.przegladarka') || titleEl.closest('div, table, form, fieldset');
   }
 
   function findPowodEdycjiField(root) {
@@ -1634,15 +1323,14 @@
   }
 
   function modPowodEdycji() {
-    // Tania bramka po ID nagłówka; przeszukanie tekstu strony tylko awaryjnie.
-    if (!document.getElementById(POWOD_EDYCJI_TITLE_ID) &&
-        !getBodyTextLower().includes(POWOD_EDYCJI_TITLE.toLowerCase())) {
+    const titleEl = document.getElementById(POWOD_EDYCJI_TITLE_ID);
+    if (!titleEl) {
       powodEdycjiDone = false;
       return;
     }
     if (powodEdycjiDone) return;
 
-    const root = findPowodEdycjiRoot();
+    const root = findPowodEdycjiRoot(titleEl);
     if (!root) return;
 
     const field = findPowodEdycjiField(root);
@@ -1717,436 +1405,60 @@
     document.addEventListener('serum-sms-sent', showSmsToast, false);
   }
 
-  // --- PODPISZ (osobny watcher) ---
+  // --- PODPIS ELEKTRONICZNY (CDA): PIN zapamiętany przez przeglądarkę → klik „Podpisz” ---
 
-  // Ustawiane przez bootPodpis() poniżej; wywoływane z uiTick(), żeby wykrywanie
-  // nowych ramek/rootów do obserwacji dzieliło jeden wspólny, debounced cykl
-  // zamiast mieć własny, osobny (i niedebounced) MutationObserver.
-  let podpisAttachAll = null;
-  // runPodpisElektroniczny() z bootPodpis() poniżej — wywoływane z UI_TICK_STEPS
-  // jak każdy inny moduł (patrz komentarz przy attachWatcher/attachListeners
-  // niżej: to wcześniej miało WŁASNY, osobny MutationObserver + input/change
-  // listenery + własny debounce 400ms na document.body, całkowicie równolegle
-  // do głównego cyklu uiTick() — każda zmiana w DOM odpalała DWA niezależne
-  // przeliczenia zamiast jednego).
-  let podpisRun = null;
+  // Potwierdzone inspektorem w panelu „PODPIS ELEKTRONICZNY”:
+  //   <input id="inp_cda_pin" class="cda_podpis naprawione" type="password" …>
+  //   <input id="chkb_cda_pin_zap" type="checkbox">  + <label for="chkb_cda_pin_zap">Zapamiętaj</label>
+  //   <a class="a_akc cda_podpis" onclick="f_cda_podpis(…)">Podpisz</a>
+  //   <a class="a_akc" onclick="f_cda_zamknij(…)">Zamknij</a>
+  // Logi 08–28.09.2026: 184 z 184 automatycznych podpisów poszło tą ścieżką
+  // (panel w logu bez tytułu = panel z a.cda_podpis). Dawna heurystyka —
+  // tytuł w tekście całego <body> i ramek iframe, przyciski „Podpisz” szukane
+  // po tekście wśród wszystkich div/span/td, osobne obserwatory mutacji na
+  // ramkach — nie zadziałała ani razu, a kosztowała ~2,8 ms na tick
+  // (dawne moduły podpisRun + podpisAttachAll, log 28.09).
+  let clickedPodpis = false;
 
-  function bootPodpis() {
-    const PAGE_PODPIS = 'PODPIS ELEKTRONICZNY';
-    let clickedPodpis = false;
-
-    function isVisible(el) {
-      if (!el?.isConnected) return false;
-      const rect = el.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) return false;
-      const style = getComputedStyle(el);
-      if (style.visibility === 'hidden' || style.display === 'none') return false;
-      return el.offsetParent !== null || style.position === 'fixed';
-    }
-
-    // Warianty tytułu (z polskimi znakami i bez) są stałe dla danego tytułu,
-    // a liczone były przy KAŻDYM porównaniu — 4 × replace() po całym stringu,
-    // w pętlach po tysiącach elementów. Liczymy raz i zapamiętujemy.
-    const titleVariantsCache = new Map();
-    function titleVariants(title) {
-      let v = titleVariantsCache.get(title);
-      if (!v) {
-        v = [
-          title.toLowerCase(),
-          title.replace(/Ą/g, 'A').replace(/ą/g, 'a').replace(/Ł/g, 'L').replace(/ł/g, 'l').toLowerCase(),
-        ];
-        titleVariantsCache.set(title, v);
-      }
-      return v;
-    }
-
-    // Wariant dla tekstu JUŻ zamienionego na małe litery (np. ze wspólnego
-    // cache'u getBodyTextLower) — bez powtórnego, kosztownego toLowerCase()
-    // po całym tekście strony.
-    function lowerTextHasTitle(lowerText, title) {
-      return titleVariants(title).some((v) => lowerText.includes(v));
-    }
-
-    function textHasTitle(text, title) {
-      return lowerTextHasTitle((text || '').toLowerCase(), title);
-    }
-
-    // Wyszukiwanie ramek jest cache'owane w obrębie jednego ticku — wołane
-    // było wielokrotnie na tick (podpisAttachAll, pageHas,
-    // findSignContextForTitle, findPasswordField, findRememberCheckbox...),
-    // za każdym razem od nowa przeszukując dokument selektorem.
-    let searchRootsCache = null;
-    let searchRootsCacheTick = -1;
-    function getSearchRoots() {
-      if (searchRootsCacheTick === uiTickCount && searchRootsCache) return searchRootsCache;
-      const roots = [document];
-      for (const frame of document.querySelectorAll('iframe, frame')) {
-        try {
-          if (frame.contentDocument?.body) roots.push(frame.contentDocument);
-        } catch (_) {}
-      }
-      searchRootsCache = roots;
-      searchRootsCacheTick = uiTickCount;
-      return roots;
-    }
-
-    function pageHas(title) {
-      // Dokument główny — ze wspólnego cache'u tekstu strony (bez tego była
-      // to PEŁNA serializacja całego <body> do stringa raz na tick, poza
-      // cache'em wprowadzonym dla pozostałych modułów).
-      if (lowerTextHasTitle(getBodyTextLower(), title)) return true;
-      if (textHasTitle(document.title, title)) return true;
-      for (const root of getSearchRoots()) {
-        if (root === document) continue;
-        if (textHasTitle(root.body?.textContent, title)) return true;
-        if (textHasTitle(root.title, title)) return true;
-      }
-      return false;
-    }
-
-    function elementLabel(el) {
-      return normLabel(el.textContent || el.value || el.getAttribute('aria-label') || '');
-    }
-
-    function ownText(el) {
-      return normLabel(
-        [...el.childNodes]
-          .filter((n) => n.nodeType === Node.TEXT_NODE || (n.nodeType === Node.ELEMENT_NODE && n.childElementCount === 0))
-          .map((n) => n.textContent)
-          .join('')
-      );
-    }
-
-    function isSignButton(el) {
-      // Najtańsza możliwa bramka: jeśli w całym poddrzewie elementu nie ma
-      // nawet słowa „Podpisz”, żaden z poniższych wariantów nie ma szans.
-      // Odsiewa praktycznie wszystkie węzły strony (selektor w
-      // findSignButtonsIn obejmuje m.in. każdy div/span/td) ZANIM policzymy
-      // znormalizowane etykiety i — co ważniejsze — zanim dotkniemy
-      // isVisible(), które wymusza przeliczenie układu strony.
-      const text = el.textContent;
-      if (!text || !text.includes('Podpisz')) return false;
-      let match = false;
-      if (elementLabel(el) === 'Podpisz') match = true;
-      else if (ownText(el) === 'Podpisz') match = true;
-      else if (el.childElementCount > 0 && el.childElementCount <= 4) {
-        for (const child of el.children) {
-          if (normLabel(child.textContent) === 'Podpisz') { match = true; break; }
-        }
-      }
-      return match && isVisible(el);
-    }
-
-    function findSignButtonsIn(scope) {
-      const root = scope || document;
-      const found = [];
-      for (const el of root.querySelectorAll(
-        'button, input[type="button"], input[type="submit"], a, div[role="button"], span[role="button"], td, span, div'
-      )) {
-        if (isSignButton(el)) found.push(el);
-      }
-      return found;
-    }
-
-    function findSignButton(scope) {
-      return findSignButtonsIn(scope)[0] || null;
-    }
-
-    function fieldHasValue(input) {
-      if (!input) return false;
-      if ((input.value || '').length > 0) return true;
-      try {
-        if (input.matches(':-webkit-autofill')) return true;
-      } catch (_) {}
-      const attr = input.getAttribute('value');
-      return !!(attr && attr.length > 0);
-    }
-
-    function findInputsIn(scope) {
-      return [...scope.querySelectorAll('input:not([type="checkbox"]):not([type="button"]):not([type="submit"])')].filter(isVisible);
-    }
-
-    function findPinNearSignButton(signBtn) {
-      let container = signBtn.parentElement;
-      for (let i = 0; i < 12 && container; i++) {
-        const pwd = container.querySelector('input[type="password"]');
-        if (pwd && isVisible(pwd)) return pwd;
-
-        for (const node of container.querySelectorAll('label, span, td, div')) {
-          const label = normLabel(node.textContent);
-          if (label !== 'PIN:' && label !== 'PIN' && !label.startsWith('Hasł')) continue;
-          const row = node.closest('tr, div, form') || node.parentElement;
-          const input = row?.querySelector('input:not([type="checkbox"]):not([type="button"]):not([type="submit"])');
-          if (input && isVisible(input)) return input;
-        }
-
-        const inputs = findInputsIn(container);
-        if (inputs.length === 1) return inputs[0];
-        if (inputs.length > 1) {
-          const btnRect = signBtn.getBoundingClientRect();
-          let best = null;
-          let bestDist = Infinity;
-          for (const input of inputs) {
-            const rect = input.getBoundingClientRect();
-            if (rect.right > btnRect.left + 8) continue;
-            const dist = btnRect.left - rect.right;
-            if (dist < bestDist) {
-              bestDist = dist;
-              best = input;
-            }
-          }
-          if (best) return best;
-        }
-
-        container = container.parentElement;
-      }
-      return null;
-    }
-
-    function findInputNearSignButton() {
-      for (const root of getSearchRoots()) {
-        for (const signBtn of findSignButtonsIn(root)) {
-          const input = findPinNearSignButton(signBtn);
-          if (input) return input;
-        }
-      }
-      return null;
-    }
-
-    function findPasswordField() {
-      for (const root of getSearchRoots()) {
-        const pwd = root.querySelector('input[type="password"]');
-        if (isVisible(pwd)) return pwd;
-      }
-
-      for (const root of getSearchRoots()) {
-        for (const node of root.querySelectorAll('label, span, td, div')) {
-          const label = normLabel(node.textContent);
-          if (label !== 'PIN:' && label !== 'PIN' && !label.startsWith('Hasł')) continue;
-          const row = node.closest('tr, div, form') || node.parentElement;
-          const input = row?.querySelector('input:not([type="checkbox"]):not([type="button"]):not([type="submit"])');
-          if (isVisible(input)) return input;
-        }
-      }
-
-      for (const root of getSearchRoots()) {
-        for (const node of root.querySelectorAll('label, span, td')) {
-          if (normLabel(node.textContent) !== 'Zapamiętaj') continue;
-          const toolbar = node.closest('div, tr, form, td') || node.parentElement;
-          if (!toolbar) continue;
-          for (const input of toolbar.querySelectorAll('input:not([type="checkbox"]):not([type="button"]):not([type="submit"])')) {
-            if (isVisible(input)) return input;
-          }
-          let sibling = node.previousElementSibling;
-          for (let i = 0; i < 4 && sibling; i++) {
-            const input = sibling.matches?.('input') ? sibling : sibling.querySelector?.('input:not([type="checkbox"])');
-            if (input && isVisible(input)) return input;
-            sibling = sibling.previousElementSibling;
-          }
-        }
-      }
-
-      return findInputNearSignButton();
-    }
-
-    function findRememberIn(panel, rootDoc) {
-      const scope = panel || rootDoc || document;
-      for (const node of scope.querySelectorAll('label, span, td')) {
-        if (normLabel(node.textContent) !== 'Zapamiętaj') continue;
-        const cb = node.querySelector('input[type="checkbox"]') ||
-          (node.htmlFor && (rootDoc || document).getElementById(node.htmlFor));
-        if (cb?.type === 'checkbox' && isVisible(cb)) return cb;
-      }
-      return null;
-    }
-
-    function findRememberCheckbox() {
-      for (const root of getSearchRoots()) {
-        const cb = findRememberIn(root.body, root);
-        if (cb) return cb;
-      }
-      return null;
-    }
-
-    function findSignContextForTitle(pageTitle) {
-      for (const root of getSearchRoots()) {
-        const titleNodes = [];
-        const maxLen = pageTitle.length + 35;
-        for (const titleNode of root.querySelectorAll('div, span, h1, h2, h3, label, td')) {
-          // Kolejność sprawdzeń od najtańszego: najpierw długość surowego
-          // tekstu (odsiewa ogromną większość węzłów bez żadnej alokacji),
-          // potem normalizacja + porównanie tekstu, a DOPIERO NA KOŃCU
-          // isVisible() — jedyne sprawdzenie wymuszające przeliczenie układu
-          // strony (getBoundingClientRect + getComputedStyle). Wcześniej
-          // isVisible() wołane było przed testem długości, czyli dla setek
-          // węzłów, które i tak zaraz odpadały.
-          const rawText = titleNode.textContent;
-          // Bardzo luźny próg (nie „maxLen + trochę”!): normLabel skleja białe
-          // znaki, więc węzeł z dużym wcięciem/nowymi liniami może mieć
-          // surowy tekst wielokrotnie dłuższy od znormalizowanego. Chodzi
-          // tylko o odsianie kontenerów z całą treścią strony, zanim
-          // zaalokujemy dla nich znormalizowaną kopię tekstu.
-          if (!rawText || rawText.length > 4000) continue;
-          const raw = normLabel(rawText);
-          if (raw.length > maxLen) continue;
-          // titleVariants zwraca warianty małymi literami — stąd toLowerCase()
-          // po stronie porównywanego tekstu.
-          const rawLower = raw.toLowerCase();
-          if (!titleVariants(pageTitle).some((v) => rawLower === v || rawLower.startsWith(v))) continue;
-          if (!isVisible(titleNode)) continue;
-          titleNodes.push(titleNode);
-        }
-
-        let best = null;
-        let bestArea = Infinity;
-
-        // Przyciski „Podpisz” wyszukiwane RAZ na cały dokument, zamiast od
-        // nowa dla każdego z 22 poziomów przodków każdego węzła tytułu.
-        // Wcześniej każdy poziom uruchamiał pełny skan poddrzewa selektorem
-        // obejmującym m.in. div/span/td — a im wyżej w drzewie, tym bliżej
-        // to było skanowania CAŁEJ strony. querySelectorAll zwraca węzły w
-        // kolejności dokumentu, więc „pierwszy przycisk zawarty w panelu”
-        // daje dokładnie ten sam wynik co dawne findSignButtonsIn(panel)[0].
-        const signBtnsInRoot = titleNodes.length ? findSignButtonsIn(root).filter(isVisible) : [];
-
-        for (const titleNode of titleNodes) {
-          const titleRect = titleNode.getBoundingClientRect();
-          let panel = titleNode;
-          for (let depth = 0; depth < 22 && panel; depth++) {
-            // b !== panel — querySelectorAll (dawna wersja) przeszukiwał tylko
-            // POTOMKÓW panelu, a contains() zwraca true także dla samego
-            // panelu. Bez tego warunku mały kontener „tytuł + Podpisz” zostałby
-            // sam uznany za przycisk (jest wcześniej w kolejności dokumentu niż
-            // jego dziecko) i klik poszedłby w kontener zamiast w przycisk.
-            const signBtn = signBtnsInRoot.find((b) => b !== panel && panel.contains(b));
-            if (signBtn) {
-              const panelRect = panel.getBoundingClientRect();
-              if (titleRect.top - panelRect.top > 90) {
-                panel = panel.parentElement;
-                continue;
-              }
-              const area = Math.max(panelRect.width * panelRect.height, 1);
-              if (area < bestArea) {
-                bestArea = area;
-                best = {
-                  signBtn,
-                  pin: findPinNearSignButton(signBtn),
-                  panel,
-                  root,
-                };
-              }
-            }
-            panel = panel.parentElement;
-          }
-        }
-
-        if (best) return best;
-      }
-      return null;
-    }
-
-    // Potwierdzone inspektorem w panelu „PODPIS ELEKTRONICZNY”:
-    //   <input id="inp_cda_pin" class="cda_podpis naprawione" type="password" …>
-    //   <input id="chkb_cda_pin_zap" type="checkbox">  + <label for="chkb_cda_pin_zap">Zapamiętaj</label>
-    //   <a class="a_akc cda_podpis" onclick="f_cda_podpis(…)">Podpisz</a>
-    //   <a class="a_akc" onclick="f_cda_zamknij(…)">Zamknij</a>
-    // Wszystkie trzy potrzebne elementy mają stałe identyfikatory/klasy, więc
-    // cała heurystyka (szukanie przycisku po tekście wśród button/a/td/span/div,
-    // potem wspinaczka po 12 poziomach przodków i wybieranie pola PIN po
-    // ODLEGŁOŚCI W PIKSELACH) jest tu zbędna. Zostaje jako ścieżka awaryjna.
-    function findPodpisSignContextById() {
-      const pin = document.getElementById('inp_cda_pin');
-      if (!isVisible(pin)) return null;
-      // Klasa cda_podpis odróżnia „Podpisz” od sąsiedniego „Zamknij”
-      // (oba mają klasę a_akc i identyczny wygląd).
-      const signBtn = [...document.querySelectorAll('a.cda_podpis, a[onclick*="f_cda_podpis"]')].find(isVisible);
-      if (!signBtn) return null;
-      const remember = document.getElementById('chkb_cda_pin_zap');
-      return {
-        signBtn,
-        pin,
-        remember: remember?.type === 'checkbox' ? remember : null,
-        panel: signBtn.closest('table, form, div') || signBtn.parentElement,
-        root: document,
-      };
-    }
-
-    function findPodpisSignContext() {
-      const byId = findPodpisSignContextById();
-      if (byId) return byId;
-
-      const ctx = findSignContextForTitle(PAGE_PODPIS);
-      if (!ctx) return null;
-      ctx.remember = findRememberIn(ctx.panel, ctx.root);
-      return ctx;
-    }
-
-    function robustClick(el) {
-      if (!el) return;
-      const target = el.closest?.('a, button, input[type="button"], input[type="submit"]') || el;
-      try { target.focus?.(); } catch (_) {}
-      target.click();
-    }
-
-    function runPodpisElektroniczny() {
-      if (!pageHas(PAGE_PODPIS)) {
-        clickedPodpis = false;
-        return;
-      }
-      if (clickedPodpis) return;
-
-      const ctx = findPodpisSignContext();
-      if (!ctx?.signBtn || !fieldHasValue(ctx.pin) || !ctx.remember?.checked) return;
-
-      clickedPodpis = true;
-      dbg('runPodpisElektroniczny: klik Podpisz, panel="' + normLabel(ctx.panel?.textContent).slice(0, 80) + '"');
-      robustClick(ctx.signBtn);
-    }
-
-    function run() {
-      runPodpisElektroniczny();
-    }
-
-    const watchedRoots = new WeakSet();
-    const watchedDocs = new WeakSet();
-
-    // Główny dokument obserwuje już wspólny MutationObserver ze start()
-    // (i globalne listenery input/click) — drugi obserwator na dokładnie tym
-    // samym document.body byłby czystym duplikatem (dwa razy ten sam koszt
-    // dostarczania rekordów mutacji za każdą zmianę w DOM, na całej stronie).
-    // Realna wartość tej funkcji to obserwacja RAMEK IFRAME — tam wspólny
-    // obserwator nie sięga (obserwuje tylko document.body głównego dokumentu).
-    function attachWatcher(root) {
-      if (!root?.body || root === document || watchedRoots.has(root.body)) return;
-      watchedRoots.add(root.body);
-      const observer = new MutationObserver(scheduleUi);
-      observer.observe(root.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['value', 'checked', 'class', 'style'] });
-    }
-
-    function attachListeners(root) {
-      if (!root || root === document || watchedDocs.has(root)) return;
-      watchedDocs.add(root);
-      root.addEventListener('input', scheduleUi, true);
-      root.addEventListener('change', scheduleUi, true);
-    }
-
-    function attachAll() {
-      for (const root of getSearchRoots()) {
-        attachWatcher(root);
-        attachListeners(root);
-      }
-    }
-
-    attachAll();
-    podpisAttachAll = attachAll;
-    podpisRun = run;
-
-    run();
-    setTimeout(run, 800);
-    setTimeout(run, 2000);
-    setTimeout(run, 4000);
+  function isPodpisVisible(el) {
+    if (!el?.isConnected) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none') return false;
+    return el.offsetParent !== null || style.position === 'fixed';
   }
 
+  function fieldHasValue(input) {
+    if (!input) return false;
+    if ((input.value || '').length > 0) return true;
+    try {
+      if (input.matches(':-webkit-autofill')) return true;
+    } catch (_) {}
+    const attr = input.getAttribute('value');
+    return !!(attr && attr.length > 0);
+  }
+
+  function modPodpisElektroniczny() {
+    const pin = document.getElementById('inp_cda_pin');
+    if (!pin) {
+      clickedPodpis = false;
+      return;
+    }
+    if (clickedPodpis || !isPodpisVisible(pin) || !fieldHasValue(pin)) return;
+    if (!document.getElementById('chkb_cda_pin_zap')?.checked) return;
+
+    // Klasa cda_podpis odróżnia „Podpisz” od sąsiedniego „Zamknij”
+    // (oba mają klasę a_akc i identyczny wygląd).
+    const signBtn = [...document.querySelectorAll('a.cda_podpis, a[onclick*="f_cda_podpis"]')].find(isPodpisVisible);
+    if (!signBtn) return;
+
+    clickedPodpis = true;
+    const panel = signBtn.closest('table, form, div') || signBtn.parentElement;
+    dbg('modPodpisElektroniczny: klik Podpisz, panel="' + normLabel(panel?.textContent).slice(0, 80) + '"');
+    try { signBtn.focus?.(); } catch (_) {}
+    signBtn.click();
+  }
   // --- LUX MED / MEDICOVER ---
 
   // Ubezpieczyciele/abonamenty, przy których świadczenia NIE zapisujemy do NFZ.
@@ -2156,68 +1468,30 @@
   const luxCache = { uwagi: null, checkbox: null };
   let luxDone = false;
 
-  function luxMatchesLabel(node, target) {
-    const want = target.toLowerCase();
-    const own = [...node.childNodes]
-      .filter((n) => n.nodeType === Node.TEXT_NODE || (n.nodeType === Node.ELEMENT_NODE && n.childElementCount === 0))
-      .map((n) => n.textContent)
-      .join(' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase();
-    if (own === want) return true;
-    const full = normalize(node.textContent || '');
-    return full === want && full.length <= 60;
-  }
-
-  function luxFindByLabel(labelText, type) {
-    for (const node of document.querySelectorAll('label, th, td, span, legend')) {
-      if (!luxMatchesLabel(node, labelText)) continue;
-      if (node.htmlFor) {
-        const linked = document.getElementById(node.htmlFor);
-        if (isOverlayElementVisible(linked) && (!type || linked.type === type)) return linked;
-      }
-      const input = node.querySelector(type ? `input[type="${type}"]` : 'input, textarea, select');
-      if (isOverlayElementVisible(input)) return input;
-      const row = node.closest('tr');
-      if (row) {
-        const cells = [...row.querySelectorAll('td, th')];
-        const idx = cells.findIndex((c) => c === node || c.contains(node));
-        for (let i = idx + 1; i < cells.length; i++) {
-          const el = cells[i].querySelector(type ? `input[type="${type}"]` : 'input, textarea, select');
-          if (isOverlayElementVisible(el)) return el;
-        }
-      }
-    }
-    return null;
-  }
-
   // Potwierdzone inspektorem w panelu „Edycja wizyty”:
   //   <input id="wize_uwagi_term_w" class="t_bord disabled_reczny" name="wize"
   //          type="text" readonly …>            (Uwagi z Terminarza)
   //   <input id="chk_zapisz_poz" type="checkbox" checked="checked">
   //                                              (Czy zapisać świadczenie)
-  // To najgorętsze miejsce w całym skrypcie — panel bywa otwarty przez
-  // większość dnia pracy, a luxFindByLabel przemiata WSZYSTKIE
-  // label/th/td/span/legend na stronie i dopasowuje po tekście etykiety.
-  // Gorzej: gdy pole nie zostało znalezione, cache zostawał pusty i ten skan
-  // powtarzał się przy KAŻDYM ticku. getElementById kończy sprawę od razu.
-  // luxFindByLabel zostaje wyłącznie jako ścieżka awaryjna.
+  // Dawne ścieżki awaryjne (przemiatanie wszystkich label/th/td/span/legend
+  // po tekście etykiety) i bramka po tekście całego <body> („uwagi z
+  // terminarza” + „czy zapisać świadczenie”) — usunięte: obie etykiety stoją
+  // przy tych właśnie polach, więc pola istnieją dokładnie wtedy, gdy panel.
   function findUwagiZTerminarza() {
-    const byId = document.getElementById('wize_uwagi_term_w');
-    if (byId) return byId;
-    return luxFindByLabel('Uwagi z Terminarza');
+    return document.getElementById('wize_uwagi_term_w');
   }
 
   function findZapiszSwiadczenieCheckbox() {
-    const byId = document.getElementById('chk_zapisz_poz');
-    if (byId?.type === 'checkbox') return byId;
-    return luxFindByLabel('Czy zapisać świadczenie', 'checkbox');
+    const cb = document.getElementById('chk_zapisz_poz');
+    return cb?.type === 'checkbox' ? cb : null;
+  }
+
+  function panelWizytyOtwarty() {
+    return !!findUwagiZTerminarza() && !!document.getElementById('chk_zapisz_poz');
   }
 
   function modLuxMed() {
-    const t = getBodyTextLower();
-    if (!t.includes('uwagi z terminarza') || !t.includes('czy zapisać świadczenie')) {
+    if (!panelWizytyOtwarty()) {
       // Panel „Edycja wizyty” zamknięty (albo jeszcze niewidoczny) — reset, żeby
       // przy następnej wizycie (ten sam pacjent lub inny — strona nie przeładowuje
       // się między wizytami) automatyzacja zadziałała od nowa. Bez tego luxDone
@@ -2263,16 +1537,14 @@
   // log mówił DLACZEGO (lista pusta? ukryta? inny format wierszy?).
   const ICD9_PENDING_TIMEOUT_MS = 8000;
   const ICD9_MAX_PROB = 3;
-  // Gdy moduł był wyciszony (okno recept) albo nie tykał przez dłuższą chwilę,
-  // zegar próby liczy się od wznowienia — inaczej po powrocie z recept od razu
-  // wpadalibyśmy w „minęło 8 s — rezygnuję”.
-  const ICD9_PRZERWA_RESET_MS = 3000;
+  // Gdy moduł był wyciszony (okno recept), zegar próby liczy się od wznowienia
+  // (patrz uiTick) — inaczej po powrocie z recept od razu wpadalibyśmy
+  // w „minęło 8 s — rezygnuję”.
 
   let icd9AutoDone = false;
   let icd9AutoPending = null;
   let icd9AutoPendingSince = 0;
   let icd9AutoProba = 0;
-  let icd9AutoOstatniTick = 0;
 
   function opiszListePodpowiedziIcd9(input) {
     const { tabele, kontenery } = icd9ElementyListy();
@@ -2305,12 +1577,11 @@
   const ICD9_WYWIAD_WNIOSEK_RE = /^pacjent prosi o leki.*pisemny wniosek o wypisanie recept/i;
 
   function wywiadMaWniosekOLeki() {
-    for (const ta of document.querySelectorAll('textarea')) {
-      if (!ta.value || !isOverlayElementVisible(ta)) continue;
-      const firstLine = ta.value.split('\n', 1)[0].trim();
-      if (ICD9_WYWIAD_WNIOSEK_RE.test(firstLine)) return true;
-    }
-    return false;
+    // Pole WYWIAD po id (jak w modWywiadFokusStart) — dawniej przelot po
+    // wszystkich textarea strony na każdym ticku, dopóki uwagi nie dawały kodu.
+    const ta = document.getElementById('wizb_wywiad_w');
+    if (!ta?.value || !isOverlayElementVisible(ta)) return false;
+    return ICD9_WYWIAD_WNIOSEK_RE.test(ta.value.split('\n', 1)[0].trim());
   }
 
   function icd9AlreadyAdded(code) {
@@ -2460,8 +1731,8 @@
   // „schowano listę”, a lista wciąż na ekranie. Dlatego wszystkie kopie.
   function icd9ElementyListy() {
     return {
-      tabele: [...document.querySelectorAll('[id="inp_uni_icd9_szybkie_tabela"]')],
-      kontenery: [...document.querySelectorAll('[id="inp_uni_icd9_szybkie_div"]')],
+      tabele: wszystkieZId('inp_uni_icd9_szybkie_tabela'),
+      kontenery: wszystkieZId('inp_uni_icd9_szybkie_div'),
     };
   }
 
@@ -2474,8 +1745,11 @@
     //                                     f_pokaz_jak_niepokazane z onfocus pola)
     //     table#inp_uni_icd9_szybkie_tabela — wyniki wyszukiwania (powstaje
     //                                     dopiero po odpowiedzi słownika)
-    const { tabele, kontenery } = icd9ElementyListy();
-    if (!tabele.length && !kontenery.length) return false;
+    // Kolejność: istnienie (O(1)) i okno czasowe (sama arytmetyka) PRZED
+    // zebraniem kopii — ta funkcja leci na każdym ticku przy otwartym panelu
+    // wizyty, a w 99% przypadków odpada już na czasie.
+    if (!document.getElementById('inp_uni_icd9_szybkie_tabela') &&
+        !document.getElementById('inp_uni_icd9_szybkie_div')) return false;
     if (!wolnoChowacListeIcd9()) {
       if (icd9OpisChowaniaLogged !== icd9AutomatZakonczonyAt && Date.now() - icd9AutomatZakonczonyAt <= ICD9_CHOWAJ_PO_AUTOMACIE_MS) {
         icd9OpisChowaniaLogged = icd9AutomatZakonczonyAt;
@@ -2490,6 +1764,8 @@
     // „bo użytkownik pisze” — mimo że nie było czym pisać.
     const poleIcd9 = findIcd9SearchInput();
     if (poleIcd9 && document.activeElement === poleIcd9) return false;
+
+    const { tabele, kontenery } = icd9ElementyListy();
 
     let wasOpen = false;
     const widoczneKontenery = kontenery.filter((k) => k.style.display !== 'none' && isOverlayElementVisible(k));
@@ -2545,11 +1821,7 @@
 
   function finishIcd9Selection() {
     hideIcd9SuggestionList();
-    // To samo pole, którego modWywiadFokusStart szuka po stałym, znanym
-    // identyfikatorze — tu było szukane kosztownym przemiataniem etykiet
-    // (luxFindByLabel skanuje wszystkie label/th/td/span/legend na stronie).
-    // luxFindByLabel zostaje jako awaryjna ścieżka, gdyby ID się zmieniło.
-    const wywiad = document.getElementById('wizb_wywiad_w') || luxFindByLabel('Wywiad');
+    const wywiad = document.getElementById('wizb_wywiad_w');
     if (wywiad?.tagName === 'TEXTAREA') {
       wywiad.focus({ preventScroll: true });
       const len = wywiad.value.length;
@@ -2608,7 +1880,7 @@
       icd9AutoPending = target;
       icd9AutoPendingSince = Date.now();
       icd9AutoProba = 1;
-      icd9AutoOstatniTick = Date.now();
+      zaplanujTickZa(ICD9_PENDING_TIMEOUT_MS + 50);
       dbg('modIcd9Auto: wpisuję kod ICD-9 ' + target + ' na podstawie uwag z terminarza i wyzwalam wyszukiwanie (próba 1/' + ICD9_MAX_PROB + ')');
       for (const t of icd9ElementyListy().tabele) t.style.display = ''; // cofnij ukrycie z finishIcd9Selection
       jakoAutomatIcd9(() => {
@@ -2630,14 +1902,11 @@
     }
 
     const teraz = Date.now();
-    if (teraz - icd9AutoOstatniTick > ICD9_PRZERWA_RESET_MS) {
-      dbg('modIcd9Auto: przerwa ' + ((teraz - icd9AutoOstatniTick) / 1000).toFixed(1) + 's w pracy modułu (okno recept?) — liczę czas próby od nowa');
-      icd9AutoPendingSince = teraz;
-    }
-    icd9AutoOstatniTick = teraz;
-
     const row = findIcd9SuggestionRow(icd9AutoPending);
     if (!row) {
+      // Limit próby sprawdza tick — gdy po wyszukiwaniu nic się w DOM nie
+      // zmienia, nie byłoby kiedy (dawniej robił to interwał co 3 s).
+      zaplanujTickZa(icd9AutoPendingSince + ICD9_PENDING_TIMEOUT_MS - teraz + 50);
       if (teraz - icd9AutoPendingSince > ICD9_PENDING_TIMEOUT_MS) {
         const stan = opiszListePodpowiedziIcd9(input);
         if (icd9AutoProba < ICD9_MAX_PROB) {
@@ -2653,6 +1922,7 @@
             });
           }
           triggerIcd9Search(icd9AutoPending, input);
+          zaplanujTickZa(ICD9_PENDING_TIMEOUT_MS + 50);
           return;
         }
         dbg('modIcd9Auto: brak podpowiedzi dla kodu ' + icd9AutoPending + ' po ' + ICD9_MAX_PROB + ' próbach — rezygnuję | ' + stan);
@@ -2761,8 +2031,7 @@
   }
 
   function modWywiadFokusStart() {
-    const t = getBodyTextLower();
-    if (!t.includes('uwagi z terminarza') || !t.includes('czy zapisać świadczenie')) {
+    if (!panelWizytyOtwarty()) {
       wywiadFokusStartDone = false; // panel zamknięty — reset na następne otwarcie
       wywiadTeleporadaDone = false;
       clearWywiadFokusRetries();
@@ -2776,7 +2045,10 @@
     // Tylko przez 2 s od wyzwolenia — zrzut #100 (18.09) pokazał, że fokus w
     // WYWIAD nie zamyka listy, a przy wolnym słowniku (3 × 8 s) lekarz
     // zostawałby bez kursora w polu na 24 s.
-    if (icd9AutoPending && Date.now() - icd9AutoPendingSince < 2000) return;
+    if (icd9AutoPending && Date.now() - icd9AutoPendingSince < 2000) {
+      zaplanujTickZa(icd9AutoPendingSince + 2000 - Date.now() + 20);
+      return;
+    }
 
     const wywiad = document.getElementById('wizb_wywiad_w');
     if (!isOverlayElementVisible(wywiad)) return;
@@ -3534,15 +2806,18 @@
   let dashboardNavDone = false;
 
   function isDashboardPage() {
-    // getBodyTextNormalized() zwija białe znaki w CAŁYM tekście strony — na
-    // ekranie roboczym Serum to kilka ms na tick (w logu z 08.09.2026 ten
-    // moduł wyszedł na 4,85 ms średnio, praktycznie w całości na tej jednej
-    // linijce). Pojedyncze słowo bez spacji w środku przechodzi normalizację
-    // bez zmian, więc jeśli nie ma go w surowym tekście, nie ma go i po
-    // normalizacji — a wtedy nie ma po co jej robić.
-    if (!getBodyTextLower().includes('ważne')) return false;
-    const t = getBodyTextNormalized();
-    return t.includes('ważne informacje') && t.includes('terminarz na dziś');
+    // Strona startowa to osobne wczytanie strony: klik „Wizyty (EDM)”
+    // (f_wizyty_nowe → document.ex.submit) przeładowuje kartę — log 28.09:
+    // klik 07:43:51.019, skrypt wstrzyknięty na nowo 07:43:51. Na stronie
+    // roboczej ten moduł nie ma więc nic do roboty, a płacił za tekst całego
+    // <body> na każdym ticku (5,4 s dziennie, skoki do 270 ms). Bramka O(1):
+    // widżet poczty wewnętrznej („Odebrane”), z którego i tak korzysta
+    // maNieprzeczytanaWiadomosc() — źródło strony startowej z cache Firefoksa.
+    if (!document.getElementById('tab_poczta_wew_zakladki')) return false;
+    // \s+ zamiast normalizacji całego tekstu (kopia z jedną spacją) — ten sam
+    // wynik bez drugiej dużej alokacji.
+    const t = document.body?.textContent || '';
+    return /ważne\s+informacje/i.test(t) && /terminarz\s+na\s+dziś/i.test(t);
   }
 
   function findWizytyEdmLink() {
@@ -3626,7 +2901,9 @@
   function isHistoriaWizytListEmpty() {
     // Każdy wiersz wyniku zaczyna się od „Wizyta z dnia: ...” — jeśli tego
     // tekstu nigdzie nie ma, dolna sekcja jest jeszcze pusta (nie filtrowano).
-    return !getBodyTextNormalized().includes('wizyta z dnia');
+    // Liczone tylko w zakładce HISTORIA WIZYT, do chwili kliknięcia Filtruj
+    // i Rozwiń (patrz modHistoriaWizytFiltr).
+    return !/wizyta\s+z\s+dnia/i.test(document.body?.textContent || '');
   }
 
   function modHistoriaWizytFiltr() {
@@ -3737,6 +3014,14 @@
     return rows;
   }
 
+  // Sama liczba wierszy — bez kopiowania ich do tablicy. isWizytyListTable
+  // pyta o nią dla KAŻDEJ tabeli strony na każdym ticku.
+  function tableBodyRowCount(table) {
+    let n = 0;
+    for (const tb of table.tBodies) n += tb.rows.length;
+    return n;
+  }
+
   // document.elementFromPoint wymusza pełne przeliczenie układu ORAZ test
   // trafienia dla całego dokumentu. Log z 08.09.2026 pokazał, że to właśnie
   // ono robi z syncTopPager najdroższy moduł ticka (~22 ms przy otwartym
@@ -3751,7 +3036,13 @@
   function isOnTopThrottled(el) {
     const teraz = Date.now();
     const zapamietane = onTopCache.get(el);
-    if (zapamietane && teraz - zapamietane.at < ON_TOP_CACHE_MS) return zapamietane.wynik;
+    if (zapamietane && teraz - zapamietane.at < ON_TOP_CACHE_MS) {
+      // Wynik z pamięci może być już nieaktualny (np. przesłona AJAX właśnie
+      // zniknęła) — jeden tick tuż po jego wygaśnięciu go odświeży. Dawniej
+      // robił to przy okazji interwał co 3 s.
+      zaplanujTickZa(zapamietane.at + ON_TOP_CACHE_MS - teraz + 20);
+      return zapamietane.wynik;
+    }
     const wynik = isOnTop(el);
     onTopCache.set(el, { at: teraz, wynik });
     return wynik;
@@ -3769,7 +3060,7 @@
 
   function isWizytyListTable(table) {
     const headerRow = table.tHead?.rows[0] || table.rows[0];
-    const wierszy = tableBodyRows(table).length;
+    const wierszy = tableBodyRowCount(table);
     const zapamietane = wizytyListTableCache.get(table);
     if (zapamietane && zapamietane.headerRow === headerRow && zapamietane.wierszy === wierszy) {
       return zapamietane.wynik;
@@ -3783,7 +3074,7 @@
     const headerRow = table.tHead?.rows[0] || table.rows[0];
     const h = (headerRow?.textContent || '').toLowerCase();
     if (h.includes('historia')) return false;
-    if (tableBodyRows(table).length < 1) return false;
+    if (tableBodyRowCount(table) < 1) return false;
     return h.includes('pacjent') && (h.includes('akcja') || h.includes('pesel') || h.includes('lp'));
   }
 
@@ -3833,8 +3124,7 @@
   const patientCellsCache = new WeakMap();
 
   function markPatientCells() {
-    for (const table of getAllTablesThisTick()) {
-      if (!isWizytyListTable(table)) continue;
+    for (const table of tabeleStrony().wizyty) {
       const rows = tableBodyRows(table);
       const cached = patientCellsCache.get(table);
       if (cached && cached.firstRow === rows[0] && cached.count === rows.length) continue;
@@ -3892,8 +3182,11 @@
   // niezależnie od tego, gdzie akurat jest przewinięta lista. To prostszy i
   // pewniejszy warunek niż testowanie piksela pod oknem.
   function jestOtwarteOknoModalne() {
-    for (const w of document.querySelectorAll('div.przegladarka')) {
-      if (isOverlayElementVisible(w)) return true;
+    // getElementsByClassName: żywa lista, którą przeglądarka trzyma w pamięci
+    // i przelicza tylko po zmianach DOM — zamiast pełnego przelotu selektorem
+    // na każdym ticku (pager:oknoModalne 0,59 ms śr., log 28.09).
+    for (const w of document.getElementsByClassName('przegladarka')) {
+      if (w.tagName === 'DIV' && isOverlayElementVisible(w)) return true;
     }
     return false;
   }
@@ -4017,10 +3310,7 @@
   // isWizytyListTable() (już używana przez klik-wiersz->Edytuj) rozpoznaje ją
   // po nagłówkach kolumn („pacjent” + „akcja”/„pesel”/„lp”), a nie po samym id.
   function jestListaWizytNaStronie() {
-    for (const table of getAllTablesThisTick()) {
-      if (isWizytyListTable(table)) return true;
-    }
-    return false;
+    return tabeleStrony().wizyty.length > 0;
   }
 
   function syncTopPager() {
@@ -4528,11 +3818,10 @@
   }
 
   function findLabOrdersTable() {
-    // Bramka za darmo: tekst całej strony i tak jest już policzony na ten tick
-    // (korzystają z niego wcześniejsze moduły). Bez frazy z nagłówka tabeli
-    // zleceń nie ma czego szukać — a to jest sytuacja przez większość dnia.
-    if (!getBodyTextLower().includes('zlecone badania')) return null;
-    return getAllTablesThisTick().find(isLabOrdersTable) || null;
+    // Bez bramki po tekście całego <body> — ta wymagała serializacji ~10 mln
+    // znaków. Tabele klasyfikuje jeden wspólny przelot na tick (tabeleStrony),
+    // a ocena każdej tabeli jest zapamiętana (labOrdersTableCache).
+    return tabeleStrony().lab;
   }
 
   function findLabRowWynikButton(row) {
@@ -4605,16 +3894,17 @@
     // przy każdym zleceniu), a dawniej robiła querySelectorAll('*') po CAŁEJ
     // stronie i normalizowała textContent każdego liścia — to były tysiące
     // alokacji stringów na jedno sprawdzenie. Teraz: (1) trafienie z ostatniego
-    // razu, jeśli wciąż pasuje, (2) wąskie selektory (nagłówek to <span> z
-    // tytułem — patrz komentarz w tryClosePodgladWynikow), (3) dopiero na końcu
-    // pełny skan jako zabezpieczenie, gdyby Serum zmieniło strukturę.
+    // razu, jeśli wciąż pasuje, (2) tytuły okien span.h3_tytul (okno zamyka
+    // div.div_close → uf_schowaj_div, czyli okno uf_pokaz_div, a to buduje
+    // tytuł właśnie tak — źródło strony), (3) wąskie selektory. Dawny pełny
+    // skan querySelectorAll('*') co 40 ms w czasie czekania na okno — usunięty.
     if (labHeadingCache?.isConnected && isPodgladWynikowHeadingEl(labHeadingCache) &&
         isOverlayElementVisible(labHeadingCache)) {
       return labHeadingCache;
     }
 
-    let candidates = [...document.querySelectorAll('span, td, div, b, font')].filter(isPodgladWynikowHeadingEl);
-    if (!candidates.length) candidates = [...document.querySelectorAll('*')].filter(isPodgladWynikowHeadingEl);
+    let candidates = [...document.getElementsByClassName('h3_tytul')].filter(isPodgladWynikowHeadingEl);
+    if (!candidates.length) candidates = [...document.querySelectorAll('span, td, div, b, font')].filter(isPodgladWynikowHeadingEl);
 
     const heading = candidates.find((el) => isOverlayElementVisible(el)) || candidates[candidates.length - 1] || null;
     labHeadingCache = heading;
@@ -5022,8 +4312,7 @@
   // nie blokował reszty, i logujemy wyjątek — żeby przy kolejnym takim
   // przypadku log pokazał REALNĄ przyczynę zamiast całkowitej ciszy.
   const UI_TICK_STEPS = [
-    ['podpisAttachAll', () => podpisAttachAll?.()],
-    ['podpisRun', () => podpisRun?.()],
+    ['modPodpisElektroniczny', modPodpisElektroniczny],
     ['modWynikiOperacji', modWynikiOperacji],
     ['modWyslijSms', modWyslijSms],
     ['modPodpiszERecepte', modPodpiszERecepte],
@@ -5046,58 +4335,21 @@
 
   const uiTickErrLogged = new Set();
 
-  // markPatientCells i findLabOrdersTable obie potrzebują „wszystkich tabel
-  // na stronie” — bez tej pamięci podręcznej każda z nich osobno uruchamiała
-  // document.querySelectorAll('table') na KAŻDYM ticku, czyli dwa pełne
-  // przeszukania całego dokumentu zamiast jednego. Cache żyje tylko w obrębie
-  // jednego uiTick() — zerowany na starcie każdego kolejnego.
-  let allTablesTickCache = null;
-  function getAllTablesThisTick() {
-    if (!allTablesTickCache) allTablesTickCache = [...document.querySelectorAll('table')];
-    return allTablesTickCache;
-  }
-
-  // Kilka modułów sprawdza „tanią bramkę” przez tekst całej strony, każdy
-  // osobno wołając document.body.textContent — to pełna serializacja całego
-  // drzewa DOM <body> do stringa, a nie jest cachowana przez przeglądarkę.
-  // Bez wspólnej pamięci podręcznej ta sama, kosztowna operacja powtarzała
-  // się do kilkunastu razy w obrębie JEDNEGO ticku (raz na moduł). Dwie
-  // wersje — surowy tekst modułów używających tylko .toLowerCase(), i wersja
-  // znormalizowana (biały znak → pojedyncza spacja, patrz normalize()) dla
-  // modułów, które już wcześniej normalizowały odstępy — żeby nie zmieniać
-  // zachowania żadnego z nich.
-  // Obie wersje wychodzą z TEGO SAMEGO stringa — dawniej każda czytała
-  // document.body.textContent osobno, czyli dwa pełne przejścia po drzewie
-  // DOM i dwie duże alokacje na tick. normalize() to zwinięcie białych znaków
-  // + trim + toLowerCase, więc wersję znormalizowaną można wyprowadzić z już
-  // zmałoliterowanej — wynik identyczny, koszt o jedno przejście mniejszy.
-  //
-  // Ważność pamięci: nie „jeden tick”, lecz „dopóki obserwator nie zobaczył
-  // mutacji innej niż szum” (domWersja, podbijana w callbacku obserwatora).
-  // Tick wyzwalany klawiszem w textarea, klikiem, fokusem okna czy interwałem
-  // bezpieczeństwa nie zmienia tekstu strony — a płacił za pełną serializację
-  // <body> (log 18.09.2026: ~3 ms na tick, przypisane pierwszemu modułowi
-  // w kolejce, podpisRun). Odfiltrowane jako szum są wyłącznie zegar sesji,
-  // liczniki znaków i zmiany atrybutów — żaden moduł nie bramkuje na ich
-  // treści, więc stary tekst jest wtedy wciąż poprawny.
-  let domWersja = 0;
-  let bodyTextWersja = -1;
-  let bodyTextLowerTickCache = null;
-  function getBodyTextLower() {
-    if (bodyTextLowerTickCache === null || bodyTextWersja !== domWersja) {
-      bodyTextLowerTickCache = (document.body?.textContent || '').toLowerCase();
-      bodyTextNormalizedTickCache = null;
-      bodyTextWersja = domWersja;
+  // Lista wizyt (markPatientCells, mini-paginacja) i tabela zleceń
+  // LABORATORIUM — JEDEN przelot po tabelach strony na tick zamiast osobnego
+  // dla każdego modułu. getElementsByTagName to żywa lista trzymana przez
+  // przeglądarkę (bez kopiowania do tablicy), a ocena każdej tabeli jest
+  // zapamiętana per tabela. Pamięć tylko w obrębie jednego uiTick().
+  let tabeleTickCache = null;
+  function tabeleStrony() {
+    if (tabeleTickCache) return tabeleTickCache;
+    const wynik = { wizyty: [], lab: null };
+    for (const t of document.getElementsByTagName('table')) {
+      if (isWizytyListTable(t)) wynik.wizyty.push(t);
+      if (!wynik.lab && isLabOrdersTable(t)) wynik.lab = t;
     }
-    return bodyTextLowerTickCache;
-  }
-  let bodyTextNormalizedTickCache = null;
-  function getBodyTextNormalized() {
-    const lower = getBodyTextLower(); // odświeża też wersję i zeruje pochodną
-    if (bodyTextNormalizedTickCache === null) {
-      bodyTextNormalizedTickCache = lower.replace(/\s+/g, ' ').trim();
-    }
-    return bodyTextNormalizedTickCache;
+    if (visCache) tabeleTickCache = wynik;
+    return wynik;
   }
 
   // --- profil czasu modułów ---
@@ -5186,11 +4438,22 @@
   // pominięcie zostawiłoby je wiszące nad oknem recept.
 
 
+  // Pokazane okna „popup-window” (serum2: Recepty, WYNIKI OPERACJI, wydruki)
+  // — żywa lista klas zamiast przelotu selektorem, wspólna dla ticka.
+  let pokazanePopupyTickCache = null;
+  function pokazanePopupy() {
+    if (pokazanePopupyTickCache) return pokazanePopupyTickCache;
+    const wynik = [];
+    for (const p of document.getElementsByClassName('popup-window')) if (p.classList.contains('show')) wynik.push(p);
+    if (visCache) pokazanePopupyTickCache = wynik; // pamięć tylko w obrębie uiTick()
+    return wynik;
+  }
+
   let oknoReceptTickCache = null;
   function oknoReceptOtwarte() {
     if (oknoReceptTickCache !== null) return oknoReceptTickCache;
     let znalezione = false;
-    for (const popup of document.querySelectorAll('.popup-window.show')) {
+    for (const popup of pokazanePopupy()) {
       const h1 = popup.querySelector('.popup-header h1');
       if (!h1 || !/recept/i.test(h1.textContent || '')) continue;
       if (!isOverlayElementVisible(popup)) continue;
@@ -5206,8 +4469,9 @@
   function uiTick() {
     uiTickCount++;
     uiLastTickAt = Date.now();
-    allTablesTickCache = null;
+    tabeleTickCache = null;
     oknoReceptTickCache = null;
+    pokazanePopupyTickCache = null;
     visCache = new WeakMap();
     const tTickStart = performance.now();
     let najgorszyMs = 0;
@@ -5217,6 +4481,8 @@
     if (cisza !== receptyCiszaOd) {
       receptyCiszaOd = cisza;
       dbg('uiTick: okno RECEPTY/E-RECEPTY ' + (cisza ? 'otwarte — wyciszam moduły panelu wizyty' : 'zamknięte — moduły panelu wizyty znów aktywne'));
+      // Czas wyciszenia nie liczy się do limitu próby ICD-9.
+      if (!cisza && icd9AutoPending) icd9AutoPendingSince = Date.now();
     }
 
     for (const [name, fn] of UI_TICK_STEPS) {
@@ -5280,6 +4546,25 @@
     }, 120);
   }
 
+  // Tick o konkretnej porze — dla modułów, które czekają na UPŁYW CZASU, a nie
+  // na zmianę w DOM (limit próby ICD-9, odświeżenie pamięci isOnTop). Zastępuje
+  // dawny interwał co 3 s, który był „siatką bezpieczeństwa” na wszelki
+  // wypadek, a dawał 28–47% wszystkich ticków (logi 22.09 i 28.09). Trzymamy
+  // tylko najbliższy termin — moduł, który dalej czeka, zgłasza się ponownie
+  // przy każdym ticku.
+  let tickZaTimer = null;
+  let tickZaAt = 0;
+  function zaplanujTickZa(ms) {
+    const at = Date.now() + Math.max(0, ms);
+    if (tickZaTimer && tickZaAt <= at) return;
+    clearTimeout(tickZaTimer);
+    tickZaAt = at;
+    tickZaTimer = setTimeout(() => {
+      tickZaTimer = null;
+      uiTick();
+    }, Math.max(0, ms));
+  }
+
   // --- RECEPTY/E-RECEPTY: Esc zamyka popup recept zamiast całej wizyty ---
 
   function bootReceptyEsc() {
@@ -5322,13 +4607,17 @@
       'keydown',
       (e) => {
         if (e.key !== 'Escape') return;
-        // Szybki test na całym body zanim ruszymy pełny skan elementów —
-        // żeby zwykły Esc poza zaświadczeniami nie kosztował nic zauważalnego.
-        if (!/(dodawanie|edycja) zaświadczenia/i.test(document.body?.textContent || '')) return;
-        const heading = [...document.querySelectorAll('*')].find((el) => {
-          const t = normalize(el.textContent || '');
-          return /^(dodawanie|edycja) zaświadczenia/.test(t) && t.length < 80 && isOverlayElementVisible(el);
-        });
+        // Okna starego Serum dostają tytuł w span.h3_tytul (uf_pokaz_div —
+        // źródło strony; tak samo POWÓD EDYCJI, IPOM, WYSYŁKA SMS z inspektora).
+        // Dawniej: tekst całego <body> przy każdym Esc, a gdy fraza była
+        // w DOM — textContent KAŻDEGO elementu (html, body… po ~10 mln znaków).
+        let heading = null;
+        for (const el of document.getElementsByClassName('h3_tytul')) {
+          if (/^(dodawanie|edycja) zaświadczenia/.test(normalize(el.textContent)) && isOverlayElementVisible(el)) {
+            heading = el;
+            break;
+          }
+        }
         if (!heading) return;
         if (window.confirm('Czy na pewno zamknąć dokument bez zapisu?')) {
           dbg('bootZaswiadczeniaEsc: potwierdzono zamknięcie zaświadczenia przez Esc');
@@ -5387,7 +4676,7 @@
     // WYSŁANIA SKIEROWANIA ELEKTRONICZNEGO” (div#ereferralFrame). Zwracamy
     // cały popup (nie sam nagłówek) — closePodgladWydruku rozpozna go po
     // klasie i zamknie właściwym dla niego przyciskiem.
-    for (const popup of document.querySelectorAll('.popup-window.show')) {
+    for (const popup of pokazanePopupy()) {
       if (!isOverlayElementVisible(popup)) continue;
       const h1 = popup.querySelector('.popup-header h1');
       if (h1 && /^wydruk\b/i.test(normLabel(h1.textContent))) return popup;
@@ -5537,7 +4826,6 @@
   function start() {
     bootLogin();
     bootSmsToast();
-    bootPodpis();
     bootReceptyEsc();
     bootZaswiadczeniaEsc();
     bootIpomEsc();
@@ -5567,7 +4855,6 @@
         } else if (isOwnUiNode(rec.target)) {
           continue;
         }
-        domWersja++;
         noteTickTrigger(rec);
         scheduleUi();
         return;
@@ -5577,14 +4864,21 @@
       childList: true,
       subtree: true,
       attributes: true,
-      // value/checked dodane przy scaleniu prywatnego obserwatora modułu
-      // PODPISZ (bootPodpis) w ten wspólny — na dokumencie głównym to teraz
-      // jedyny obserwator, więc musi pokrywać też to, co tamten łapał.
-      attributeFilter: ['class', 'style', 'value', 'checked'],
+      // value/checked — strona ustawia też atrybut (nie tylko właściwość):
+      // w logu 28.09 m.in. input#hid_idkontaktu[value] przy zmianie wizyty.
+      // disabled — przycisk („Podpisz” itp.) odblokowany przez stronę bez innej
+      // zmiany w DOM; dawniej łapał to dopiero interwał co 3 s.
+      attributeFilter: ['class', 'style', 'value', 'checked', 'disabled'],
     });
     document.addEventListener('input', scheduleUi, true);
     document.addEventListener('click', scheduleUiSoon, true);
     window.addEventListener('resize', scheduleUi);
+    // Mini-paginacja i przycisk „Skopiuj ostatnie wyniki” są pozycjonowane
+    // względem elementów strony — przewinięcie kontenera przesuwa je bez
+    // żadnej mutacji. Tylko gdy któryś z nich jest na stronie.
+    document.addEventListener('scroll', () => {
+      if (topPagerEl || labCopyBtnEl) scheduleUi();
+    }, { capture: true, passive: true });
     // Po zamknięciu systemowego okna drukowania strona odzyskuje fokus,
     // a w DOM nic się nie zmienia — bez tego ticka modPodgladWydrukuFokus nie
     // miałby kiedy ściągnąć fokusu z ramki PDF.
@@ -5592,15 +4886,6 @@
 
     uiTick();
     setTimeout(uiTick, 800);
-    markPatientCells();
-
-    // Niezależna siatka bezpieczeństwa: gdyby coś (nieznana podmiana
-    // document.body przez Serum, zgubiony listener, cokolwiek innego niż
-    // wyjątek w module — ten już łapiemy wyżej) na trwałe uciszyło
-    // obserwator/listenery i żaden z nich przestał wywoływać uiTick(), ten
-    // interwał i tak wymusi tick co 3s. Koszt pomijalny — większość modułów
-    // to szybkie „już obsłużone, wyjdź” przy braku zmian.
-    setInterval(uiTick, 3000);
   }
 
   if (document.body) start();
