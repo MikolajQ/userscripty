@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         WP Poczta - poprawki interfejsu (baner + scroll)
 // @namespace    http://tampermonkey.net/
-// @version      1.6.0
+// @version      1.7.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/wp-poczta-blokuj-baner.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/wp-poczta-blokuj-baner.user.js
-// @description  Ukrywa górny, pomarańczowy baner reklamowy z przyciskiem "ROZWIŃ" na poczta.wp.pl oraz zepsute wiersze reklam wstawione na listę maili (skeleton, który nigdy się nie wczytuje, bo jego skrypt blokuje CSP strony) — dopasowanie po treści i rozmiarze, nie po nazwach klas CSS (te WP losuje przy każdym wdrożeniu) — automatycznie zaznacza i usuwa maile od nadawców z "/WP" w nazwie (reklamy partnerskie) — a także naprawia przewijanie kółkiem myszy, które strona blokuje przez preventDefault() na wheel.
+// @description  Ukrywa pusty, zarezerwowany slot reklamowy u góry poczta.wp.pl oraz zepsute wiersze reklam wstawione na listę maili (skeleton, który nigdy się nie wczytuje, bo jego skrypt blokuje CSP strony) — dopasowanie po treści i rozmiarze, nie po nazwach klas CSS (te WP losuje przy każdym wdrożeniu) — automatycznie zaznacza i usuwa maile od nadawców z "/WP" w nazwie (reklamy partnerskie) — a także naprawia przewijanie kółkiem myszy, które strona blokuje przez preventDefault() na wheel.
 // @match        https://poczta.wp.pl/*
 // @grant        none
 // @run-at       document-start
@@ -13,42 +13,15 @@
 (function () {
   'use strict';
 
-  // Baner reklamowy ma przycisk z tym tekstem. WP renderuje go wielkimi
-  // literami przez CSS (text-transform: uppercase), ale sam DOM może
-  // zawierać "Rozwiń" pisane inną wielkością liter — dlatego dopasowanie
-  // musi być bez rozróżniania wielkości liter.
-  const TRIGGER_RE = /^rozwiń\b/i;
+  // Dawne szukanie baneru po przycisku „ROZWIŃ” (przelot po WSZYSTKICH
+  // button/a/div/span strony co klatkę) usunięte: wzorzec /^rozwiń\b/i nie
+  // pasował nigdy — w JS bez flagi u „\b” uznaje za literę tylko [A-Za-z0-9_],
+  // więc po „ń” granicy słowa nie ma ani na końcu tekstu, ani przed spacją
+  // (sprawdzone: false dla „Rozwiń”, „ROZWIŃ”, „Rozwiń reklamę”; ten sam
+  // wzorzec był już w 1.5.0). Ta gałąź nie ukryła więc nigdy niczego.
 
   const hiddenContainers = new WeakSet();
   let scheduled = false;
-
-  function isLeafish(el) {
-    // Sam przycisk/etykieta, nie duży kontener z wieloma dziećmi.
-    return el.children.length <= 2;
-  }
-
-  function findAdContainer(trigger) {
-    // Baner to poziomy pasek u góry strony: pełna szerokość, niewielka
-    // wysokość, tuż przy górnej krawędzi widoku. Wspinamy się po przodkach
-    // i bierzemy NAJBARDZIEJ ZEWNĘTRZNEGO z pasujących — reklama bywa
-    // zagnieżdżona w kilku "cienkich" wrapperach, z których każdy osobno
-    // rezerwuje wysokość (dlatego ukrycie samego wewnętrznego diva potrafiło
-    // zostawiać puste miejsce). Wychodzimy z pętli, gdy trafimy na przodka,
-    // który już nie pasuje do kształtu baneru (bo to np. cały <body>).
-    let el = trigger;
-    let candidate = null;
-    for (let depth = 0; depth < 12 && el && el !== document.body; depth++) {
-      const rect = el.getBoundingClientRect();
-      const looksLikeBanner = rect.top < 250 && rect.width > 300 && rect.height >= 10 && rect.height <= 250;
-      if (looksLikeBanner) {
-        candidate = el;
-      } else if (candidate) {
-        break;
-      }
-      el = el.parentElement;
-    }
-    return candidate;
-  }
 
   function collapse(el) {
     hiddenContainers.add(el);
@@ -99,18 +72,17 @@
   // wspólny obu wariantom to klasa siatki: WP koduje w niej wprost nazwy
   // obszarów grid-template-areas, a ta reklama ma "adInfo"/"adContent" —
   // czego prawdziwa wiadomość (inny układ: nadawca/temat/data) nie ma.
-  const AD_GRID_CLASS_RE = /adInfo_adContent/;
-
+  // Podciąg klasy w selektorze — ten sam test co dawne wyrażenie na
+  // className, ale robi go przeglądarka, zamiast skryptu dla każdego <div>.
   function findAdGridContainers() {
-    return [...document.querySelectorAll('div')].filter((el) => AD_GRID_CLASS_RE.test(el.className || ''));
+    return document.querySelectorAll('div[class*="adInfo_adContent"]');
   }
 
   function findAdRowContainer(gridEl) {
     // Wspinamy się od kontenera siatki reklamy w górę, biorąc NAJBARDZIEJ
     // ZEWNĘTRZNEGO przodka, który wciąż wygląda jak pojedynczy wiersz listy
-    // (rozsądna wysokość, prawie pełna szerokość) — tak jak przy banerze
-    // u góry strony (findAdContainer) — żeby ukryć całe zarezerwowane
-    // miejsce, nie tylko wewnętrzną siatkę.
+    // (rozsądna wysokość, prawie pełna szerokość) — żeby ukryć całe
+    // zarezerwowane miejsce, nie tylko wewnętrzną siatkę.
     let el = gridEl;
     let candidate = gridEl;
     for (let depth = 0; depth < 8 && el.parentElement; depth++) {
@@ -133,15 +105,6 @@
   }
 
   function scan() {
-    for (const el of document.querySelectorAll('button, a, div, span')) {
-      if (!isLeafish(el)) continue;
-      if (!TRIGGER_RE.test((el.textContent || '').trim())) continue;
-
-      const container = findAdContainer(el);
-      if (!container || hiddenContainers.has(container)) continue;
-      collapse(container);
-    }
-
     const reserved = findReservedAdSlot();
     if (reserved) collapse(reserved);
 
@@ -240,8 +203,10 @@
   // --- NAPRAW PRZEWIJANIE KÓŁKIEM MYSZY ---
   //
   // Coś na stronie blokuje domyślne przewijanie (preventDefault na wheel) —
-  // strona przewija się tylko przez przeciąganie suwaka. Zamiast szukać, co
-  // dokładnie to blokuje, odtwarzamy przewijanie ręcznie.
+  // strona przewija się tylko przez przeciąganie suwaka. Odtwarzamy
+  // przewijanie ręcznie, ale TYLKO dla zdarzeń, które strona faktycznie
+  // zablokowała (defaultPrevented). Dawniej przewijaliśmy zawsze — gdyby WP
+  // przestało blokować kółko, strona przewijałaby się podwójnie.
 
   function findScrollTarget(start, deltaY) {
     // Jeśli kursor jest nad elementem z prawdziwym własnym scrollem
@@ -264,12 +229,18 @@
     return document.scrollingElement || document.documentElement;
   }
 
+  // defaultPrevented sprawdzamy po zakończeniu obsługi zdarzenia
+  // (setTimeout 0): nasz nasłuch, dodany przy document-start, może się
+  // wykonać PRZED blokującym nasłuchem strony.
   window.addEventListener(
     'wheel',
     (e) => {
-      const target = findScrollTarget(e.target, e.deltaY);
-      target.scrollTop += e.deltaY;
-      target.scrollLeft += e.deltaX;
+      setTimeout(() => {
+        if (!e.defaultPrevented) return;
+        const target = findScrollTarget(e.target, e.deltaY);
+        target.scrollTop += e.deltaY;
+        target.scrollLeft += e.deltaX;
+      }, 0);
     },
     { passive: true }
   );
