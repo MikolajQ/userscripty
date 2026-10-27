@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Medfile — narzędzia (wizyty, zalecenia, badania.pl)
 // @namespace    medfile-tools
-// @version      5.8
+// @version      5.9
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/medfile-tools.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/medfile-tools.user.js
 // @description  Połączone skrypty do Medfile: auto-rozwijanie wizyt w podglądzie, generowanie i wysyłka zaleceń jako PDF DL bezpośrednio z pola bez pośrednictwa druku Medfile i bez okna potwierdzenia (dane pacjenta czytane wprost z karty; zapis pliku przez lokalny odbiornik HTTP pdf-receiver.py, żeby ominąć kaprysy przeglądarkowego pobierania), szablony badań w Badania.pl, strzałki podziału stron w polu Zalecenia (dokładne — ten sam silnik składu co finalny PDF). ukrywanie nieużywanych sekcji karty wizyty (Objawy, Badania specjalistyczne, Leczenie), pływający przycisk "Zapisz zmiany", który trzyma pozycję przewijania, otwiera z powrotem podgląd wizyt, cytuje komunikat serwera po zapisie i ostrzega przed wyjściem z niezapisanymi zmianami, pozwala przewijać kartę wizyty przy otwartym podglądzie. Jeden wspólny MutationObserver zamiast sześciu osobnych.
@@ -1143,7 +1143,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       const wiekTxt = dataUr ? `${formatujDate(dataUr)} (${wiekLat(dataUr)} lat)` : '';
       const adres = odczytajAdres();
       const data = formatujDate(new Date());
-      const prawy = [data, pacjent, wiekTxt, `PESEL: ${pesel}`, adres.ulica, adres.miasto].filter((l) => l !== '');
+      const prawy = [data, pacjent, wiekTxt, `PESEL: ${pesel}`, adres.miasto, adres.ulica].filter((l) => l !== '');
 
       const doc = Sklad.generujPdf(prawy, pacjent, textarea.value);
       const plik = nazwaPliku(pacjent, data);
@@ -1566,7 +1566,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
 
     // Liczba linii prawej kolumny nagłówka wpływa na to, gdzie zaczyna się
     // treść na stronie 1 — bez rzeczywistych danych pacjenta zakładamy
-    // typowe 6 linii (data, imię i nazwisko, data ur., PESEL, ulica, miasto)
+    // typowe 6 linii (data, imię i nazwisko, data ur., PESEL, kod+miasto, ulica)
     // — to tylko orientacyjny podgląd w polu, finalny PDF liczy dokładnie.
     const ZALOZONA_LICZBA_LINII_PRAWY = 6;
 
