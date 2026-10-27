@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kopiowanie wyników badań → Serum (BADANIE PRZEDMIOTOWE)
 // @namespace    local.lab-to-serum
-// @version      0.6.30
+// @version      0.6.31
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/lab-to-serum.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/lab-to-serum.user.js
 // @description  Automatycznie kopiuje wyniki badań ze strony laboratorium do schowka
@@ -1587,12 +1587,6 @@
     return hasInProgressBanner();
   }
 
-  function hasNewSectionsSince(beforeFingerprints) {
-    const current = buildLabSections();
-    if (!current.length) return false;
-    return current.some((section) => !beforeFingerprints.has(section.fingerprint));
-  }
-
   function getResultsSignature() {
     const patient = extractLabelValuePairs(findSectionRoot(CONFIG.lab.patientHeading));
     const tables = findResultsTables();
@@ -1612,19 +1606,28 @@
       const knownFingerprints = beforeFingerprints || new Set();
       let settled = false;
       let observer = null;
+      // Jedno odpytywanie co 60 ms na całe czekanie. Dawniej każde wywołanie
+      // check() z obserwatora zakładało WŁASNY łańcuch setTimeout(check, 60),
+      // więc po kilkudziesięciu partiach mutacji (wczytanie wyniku) biegło
+      // równolegle kilkadziesiąt pętli, każda z pełnym parsowaniem tabel.
+      let timer = null;
 
       const finish = (status) => {
         if (settled) return;
         settled = true;
         observer?.disconnect();
+        clearTimeout(timer);
         resolve(status);
       };
 
       const check = () => {
+        if (settled) return;
+        clearTimeout(timer);
         const elapsed = Date.now() - start;
         const pageSections = buildLabSections();
         const hasRows = pageSections.length > 0;
-        const hasNew = hasNewSectionsSince(knownFingerprints);
+        // Z tych samych sekcji — dawne hasNewSectionsSince() parsowało tabele drugi raz.
+        const hasNew = pageSections.some((section) => !knownFingerprints.has(section.fingerprint));
 
         if (hasRows && hasNew) {
           finish('ready');
@@ -1666,7 +1669,7 @@
           return;
         }
 
-        setTimeout(check, 60);
+        timer = setTimeout(check, 60);
       };
 
       observer = new MutationObserver(check);
@@ -1904,26 +1907,45 @@
     return true;
   }
 
+  // Odpytywanie i obserwator kończą się RAZEM — przy sukcesie, po czasie albo
+  // przez disconnect() zwróconego uchwytu. Dawniej sukces jednej drogi nie
+  // zatrzymywał drugiej: po auto-kopii odpytywanie co 1 s trwało do 120 s
+  // (pełne isLabReadyForCollection z innerText tabel), a disconnect() przy
+  // kolejnym wyszukaniu zatrzymywał tylko obserwatora, więc pętle z
+  // poprzednich wyszukań biegły równolegle.
   function waitUntil(predicate, onSuccess, { maxWaitMs, intervalMs, onTimeout }) {
     const start = Date.now();
+    let done = false;
+    let timer = null;
+    let observer = null;
+
+    const stop = () => {
+      done = true;
+      clearTimeout(timer);
+      observer?.disconnect();
+    };
 
     const attempt = () => {
+      if (done) return;
       if (predicate()) {
+        stop();
         onSuccess();
         return;
       }
       if (Date.now() - start >= maxWaitMs) {
+        stop();
         onTimeout?.();
         return;
       }
-      setTimeout(attempt, intervalMs);
+      timer = setTimeout(attempt, intervalMs);
     };
 
     attempt();
+    if (done) return { disconnect: stop };
 
-    const observer = new MutationObserver(() => {
-      if (predicate()) {
-        observer.disconnect();
+    observer = new MutationObserver(() => {
+      if (!done && predicate()) {
+        stop();
         onSuccess();
       }
     });
@@ -1934,8 +1956,7 @@
       attributes: true,
     });
 
-    setTimeout(() => observer.disconnect(), maxWaitMs);
-    return observer;
+    return { disconnect: stop };
   }
 
   function startLabAutoRun() {
