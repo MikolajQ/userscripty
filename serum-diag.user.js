@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — diagnostyka DOM (tymczasowa)
 // @namespace    local.serum-diag
-// @version      1.0.0
+// @version      1.1.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-diag.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-diag.user.js
-// @description  Sam robi zrzuty struktury strony Serum (id, klasy, tabele, ramki, liczniki) w kolejnych stanach pracy i zapisuje je w localStorage — dane do dalszej optymalizacji serum-ui. Niczego nie zmienia na stronie, wyłącza się sam po 7 dniach.
+// @description  Sam robi zrzuty struktury strony Serum (id, klasy, tabele, ramki, liczniki) w kolejnych stanach pracy i odkłada log debug serum-ui — wszystko w localStorage — dane do dalszej optymalizacji serum-ui. Niczego nie zmienia na stronie, wyłącza się sam po 7 dniach.
 // @match        https://s2.serum.com.pl/*
 // @noframes
 // @grant        none
@@ -21,6 +21,9 @@
   const CO_ILE_MS = 3000;            // sprawdzenie stanu strony
   const PONOW_PO_MS = 45 * 60000;    // ten sam stan — kolejny zrzut najwcześniej po tylu ms
   const LIMIT_ZNAKOW = 1500000;      // cały zapis w localStorage (limit Firefoksa: 5 MB na witrynę)
+  const KLUCZ_LOG = 'serum_diag_log_v1';
+  const LOG_CO_ILE_MS = 15 * 60000;  // kopia logu debug serum-ui
+  const LOG_URUCHOMIEN = 12;         // tyle ostatnich wstrzyknięć serum-ui trzymamy (~80 KB każde)
 
   function czytaj() {
     try { return JSON.parse(localStorage.getItem(KLUCZ) || 'null'); } catch (e) { return null; }
@@ -38,7 +41,8 @@
   }
 
   // Ciągi cyfr (PESEL, numery kart, id pacjenta w onclick) nie są potrzebne
-  // do analizy struktury strony.
+  // do analizy struktury strony. Tylko w tym, co przychodzi ze strony — w 1.0.0
+  // maska szła po całym zrzucie i zjadała też liczniki („tekst body: # zn.”).
   const maskuj = (s) => String(s).replace(/\d{5,}/g, '#');
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
 
@@ -58,7 +62,7 @@
       if (/recept/.test(h)) st.push('recepty');
       else if (/^wydruk/.test(h)) st.push('wydruk');
       else if (/wyniki? operacji/.test(h)) st.push('wyniki-operacji');
-      else st.push('popup#' + (p.id || '?'));
+      else st.push('popup#' + maskuj(p.id || '?'));
     }
     for (const el of document.querySelectorAll('[id^="podgladWydruku"]')) {
       if (widoczny(el)) { st.push('wydruk'); break; }
@@ -68,7 +72,7 @@
       const x = norm(t.textContent);
       if (/podgl[ąa]d\s+wynik[óo]w/.test(x)) st.push('lab-podglad');
       else if (/^(dodawanie|edycja) zaświadczenia/.test(x)) st.push('zaswiadczenie');
-      else st.push('okno#' + (t.id || '?'));
+      else st.push('okno#' + maskuj(t.id || '?'));
     }
     if (widoczny(document.querySelector('a[href*="wizhist_f_zastosuj_filtr"]'))) st.push('historia');
     if (document.getElementById('wize_uwagi_term_w') && document.getElementById('chk_zapisz_poz')) st.push('praca');
@@ -83,8 +87,8 @@
 
   function zrzut(stan) {
     const t00 = performance.now();
-    const opis = (el) => !el ? '-' : el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
-      (el.classList && el.classList.length ? '.' + [...el.classList].slice(0, 3).join('.') : '');
+    const opis = (el) => !el ? '-' : el.tagName.toLowerCase() + maskuj((el.id ? '#' + el.id : '') +
+      (el.classList && el.classList.length ? '.' + [...el.classList].slice(0, 3).join('.') : ''));
     const sciezka = (el) => {
       const p = [];
       for (let e = el, i = 0; e && i < 7; e = e.parentElement, i++) {
@@ -93,7 +97,7 @@
       }
       return p.join(' < ');
     };
-    const atr = (el) => [...el.attributes].map((a) => a.name + '="' + a.value.slice(0, 70) + '"').join(' ');
+    const atr = (el) => maskuj([...el.attributes].map((a) => a.name + '="' + a.value.slice(0, 70) + '"').join(' '));
     const out = ['=== ' + stan + ' | ' + new Date().toLocaleTimeString('pl-PL') + ' | ' + location.pathname];
     // Powtarzające się wiersze (np. dziesiątki kopii tej samej tabeli) zliczamy.
     const zlicz = new Map();
@@ -136,13 +140,14 @@
     out.push('div.przegladarka: ' + okna.length + ' (widocznych ' + okna.filter(widoczny).length + ')');
     const tytuly = new Map();
     for (const t of document.getElementsByClassName('h3_tytul')) {
-      const k = (t.id || '(bez id)') + (widoczny(t) ? ' W' : '');
+      const k = maskuj(t.id || '(bez id)') + (widoczny(t) ? ' W' : '');
       tytuly.set(k, (tytuly.get(k) || 0) + 1);
     }
     out.push('.h3_tytul: ' + [...tytuly].map((p) => p[0] + (p[1] > 1 ? ' ×' + p[1] : '')).join(', '));
     out.push('.popup-window: ' + [...document.getElementsByClassName('popup-window')]
       .map((p) => opis(p) + (widoczny(p) ? ' W' : '')).join(' | '));
     out.push('compatMode: ' + document.compatMode);
+    out.push('serum-ui: ' + stanSerumUi());
 
     const ID = ['wysylkaSmsKodowDostepowychEdokumentow', 'edokumenty_sms_wyslij', 'powodEdycji', 'inp_cda_pin',
       'chkb_cda_pin_zap', 'eReceptaPin', 'electronicIPOMPopup', 'inp_ezla_logowanie_pin', 'inp_ezla_podpis_pin',
@@ -181,7 +186,7 @@
       try { const u = new URL(src, location.href); src = u.protocol === 'blob:' ? 'blob:' : u.origin + u.pathname; } catch (e) {}
       let dostep;
       try { dostep = f.contentDocument ? 'TAK ' + f.contentDocument.contentType + ' elementów=' + f.contentDocument.getElementsByTagName('*').length : 'nie'; } catch (e) { dostep = 'wyjątek'; }
-      dodaj('ramka ' + opis(f) + ' src=' + src.slice(0, 90) + ' dostęp=' + dostep + (widoczny(f) ? ' W' : '') +
+      dodaj('ramka ' + opis(f) + ' src=' + maskuj(src.slice(0, 90)) + ' dostęp=' + dostep + (widoczny(f) ? ' W' : '') +
         ' w: ' + sciezka(f.parentElement));
     }
     wypiszZliczone();
@@ -213,7 +218,60 @@
     }
     const ms = performance.now() - t00;
     out.push('czas zrzutu: ' + ms.toFixed(0) + ' ms');
-    return { at: Date.now(), ms: Math.round(ms), txt: maskuj(out.join('\n')) };
+    return { at: Date.now(), ms: Math.round(ms), txt: out.join('\n') };
+  }
+
+  // --- log debug serum-ui ---
+
+  // serum-ui od 3.121 wystawia window.__serumUiLog() — ten sam tekst co
+  // „Zapisz log debug do pliku” (wersja, ticki, wyzwalacze, czasy modułów,
+  // 800 wpisów). Starsza wersja trzyma w sessionStorage same wpisy.
+  const SS_LOG = 'serum_ui_debug_log_v1';
+
+  function wpisySesji() {
+    try { const a = JSON.parse(sessionStorage.getItem(SS_LOG) || 'null'); return Array.isArray(a) ? a : null; } catch (e) { return null; }
+  }
+
+  function stanSerumUi() {
+    if (typeof window.__serumUiLog === 'function') {
+      try {
+        const t = window.__serumUiLog();
+        const g = (re) => { const m = t.match(re); return m ? m[1] : '?'; };
+        return g(/^Wersja skryptu: (.*)$/m) + ', wstrzyknięty ' + g(/^Skrypt wstrzyknięty: (.*)$/m) +
+          ', ostatni tick ' + g(/^Ostatni uiTick\(\): (.*)$/m);
+      } catch (e) { return 'wyjątek: ' + maskuj(e && e.message || e); }
+    }
+    const w = wpisySesji();
+    if (w) return 'bez __serumUiLog (wersja < 3.121), wpisów w sessionStorage ' + w.length +
+      (w.length ? ', ostatni: ' + maskuj(w[w.length - 1].slice(0, 60)) : '');
+    // 3.120 zapisuje log dopiero 5 s po pierwszym wpisie — pusty nie znaczy jeszcze, że nie działa.
+    return 'brak __serumUiLog i logu w sessionStorage (wersja < 3.121 bez wpisów albo skrypt nie działa)';
+  }
+
+  // PESEL 11, NIP 10, telefon 9 cyfr — liczniki w nagłówku logu są krótsze.
+  const maskujLog = (s) => String(s).replace(/\d{9,}/g, '#');
+
+  function odlozLog() {
+    let txt, boot;
+    if (typeof window.__serumUiLog === 'function') {
+      try { txt = window.__serumUiLog(); } catch (e) { return; }
+      const m = txt.match(/^Skrypt wstrzyknięty: (.*?) \(/m);
+      boot = m ? m[1] : '?';
+    } else {
+      const w = wpisySesji();
+      if (!w || !w.length) return;
+      txt = '(serum-ui < 3.121: tylko wpisy z sessionStorage)\n' + w.join('\n');
+      boot = 'sesja';
+    }
+    let log;
+    try { log = JSON.parse(localStorage.getItem(KLUCZ_LOG) || 'null'); } catch (e) { log = null; }
+    if (!log || typeof log !== 'object') log = {};
+    // Klucz: dzień + chwila wstrzyknięcia — jedno uruchomienie serum-ui = jeden wpis, nadpisywany.
+    const klucz = new Date().toLocaleDateString('pl-PL') + ' ' + boot;
+    log[klucz] = { at: Date.now(), txt: maskujLog(txt) };
+    const klucze = Object.keys(log).sort((a, b) => log[a].at - log[b].at);
+    while (klucze.length > LOG_URUCHOMIEN) delete log[klucze.shift()];
+    try { localStorage.setItem(KLUCZ_LOG, JSON.stringify(log)); } catch (e) {}
   }
 
   // --- harmonogram ---
@@ -245,4 +303,7 @@
   }
 
   setInterval(sprawdz, CO_ILE_MS);
+  setTimeout(odlozLog, 60000);
+  setInterval(odlozLog, LOG_CO_ILE_MS);
+  window.addEventListener('pagehide', odlozLog);
 })();

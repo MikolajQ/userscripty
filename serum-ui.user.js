@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.120.0
+// @version      3.121.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.120.0';
+  const SCRIPT_VERSION = '3.121.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -515,6 +515,13 @@
       (DEBUG_LOG.join('\n') || '(pusto)')
     );
   }
+
+  // Ten sam tekst dla serum-diag.user.js, który co kwadrans odkłada go do
+  // localStorage — log trafia do analizy bez menu Tampermonkeya i kopiowania.
+  try {
+    if (typeof exportFunction === 'function') exportFunction(buildLogText, unsafeWindow, { defineAs: '__serumUiLog' });
+    else unsafeWindow.__serumUiLog = buildLogText;
+  } catch (_) {}
 
   GM_registerMenuCommand?.('Pokaż log debug (Serum)', () => {
     alert(buildLogText());
