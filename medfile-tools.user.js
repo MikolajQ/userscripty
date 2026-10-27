@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Medfile — narzędzia (wizyty, zalecenia, badania.pl)
 // @namespace    medfile-tools
-// @version      5.7
+// @version      5.8
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/medfile-tools.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/medfile-tools.user.js
 // @description  Połączone skrypty do Medfile: auto-rozwijanie wizyt w podglądzie, generowanie i wysyłka zaleceń jako PDF DL bezpośrednio z pola bez pośrednictwa druku Medfile i bez okna potwierdzenia (dane pacjenta czytane wprost z karty; zapis pliku przez lokalny odbiornik HTTP pdf-receiver.py, żeby ominąć kaprysy przeglądarkowego pobierania), szablony badań w Badania.pl, strzałki podziału stron w polu Zalecenia (dokładne — ten sam silnik składu co finalny PDF). ukrywanie nieużywanych sekcji karty wizyty (Objawy, Badania specjalistyczne, Leczenie), pływający przycisk "Zapisz zmiany", który trzyma pozycję przewijania, otwiera z powrotem podgląd wizyt, cytuje komunikat serwera po zapisie i ostrzega przed wyjściem z niezapisanymi zmianami, pozwala przewijać kartę wizyty przy otwartym podglądzie. Jeden wspólny MutationObserver zamiast sześciu osobnych.
@@ -2037,21 +2037,26 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
       return v;
     }
 
-    // Miejsce, w którym pracujesz, jest ważniejsze niż to, gdzie akurat
-    // stoi pasek przewijania w chwili kliknięcia. Przy każdym wpisaniu
-    // znaku w formularzu odnotowujemy bieżącą pozycję — jeśli cokolwiek
-    // wyzeruje ją tuż przed zapisem, mamy dokąd wrócić.
-    ['input', 'keyup', 'focusin'].forEach(function (z) {
-      document.addEventListener(z, function (ev) {
-        const t = ev.target;
-        if (t && typeof t.closest === 'function' && t.closest('#edit-visit')) zapamietajBiezaca();
-      }, true);
-    });
-
-    // Zdarzenie scroll leci także wtedy, gdy stronę przewinie coś innego niż
-    // nasze kółko (klawiatura w polu, przewinięcie do zaznaczonego elementu).
-    addEventListener('scroll', function () { zapamietajBiezaca('scroll'); }, { passive: true });
-    document.addEventListener('scroll', function () { zapamietajBiezaca('scroll'); }, { passive: true, capture: true });
+    // Pozycja zmienia się WYŁĄCZNIE przez przewinięcie, a każde przewinięcie
+    // (kółko, klawiatura w polu, skok do kursora, skrypt strony) wysyła
+    // zdarzenie scroll. Dawne nasłuchy input/keyup/focusin w formularzu nic
+    // do tego nie dokładały, a kosztowały: kandydaciPrzewijania() czyta
+    // getComputedStyle i scrollHeight przodków formularza, więc przy KAŻDYM
+    // naciśnięciu klawisza (input + keyup) wymuszały przeliczenie układu
+    // strony zmienionej właśnie wpisanym znakiem.
+    //
+    // Jeden nasłuch w fazie przechwytywania na dokumencie widzi przewinięcie
+    // dokumentu i każdego kontenera (dawny drugi nasłuch na window dublował
+    // przewinięcia dokumentu), a odczyt robimy najwyżej raz na klatkę.
+    let odczytZaplanowany = false;
+    document.addEventListener('scroll', function () {
+      if (odczytZaplanowany) return;
+      odczytZaplanowany = true;
+      requestAnimationFrame(function () {
+        odczytZaplanowany = false;
+        zapamietajBiezaca();
+      });
+    }, { passive: true, capture: true });
 
     function naKolku(ev) {
       if (!przewijanieLewejWlaczone()) return;
@@ -2339,18 +2344,27 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
     // ignoruje przewijanie kółkiem. scrollTop działa mimo hidden i to on
     // wykonuje tu całą robotę; window.scrollTo zostaje wyłącznie jako zapas
     // na wypadek, gdyby scrollingElement nie był elementem przewijanym.
-    function pozycja() {
+    function pozycja(kandydaci) {
       let max = window.scrollY || 0;
-      kandydaciPrzewijania().forEach(function (el) { if (el.scrollTop > max) max = el.scrollTop; });
+      (kandydaci || kandydaciPrzewijania()).forEach(function (el) { if (el.scrollTop > max) max = el.scrollTop; });
       return max;
     }
 
     // Ustawiamy na WSZYSTKICH kandydatach. Przypisanie scrollTop elementowi,
     // który nie jest przewijalny, jest nieszkodliwe (przeglądarka je pomija),
     // a dzięki temu nie musimy zgadywać, który z nich jest tym właściwym.
+    // Zwraca osiągniętą pozycję. Lista kandydatów nie zależy od scrollTop
+    // (overflow i wysokości), więc liczymy ją raz — dawniej trzy razy na
+    // klatkę pętli odtwarzania, każdy z getComputedStyle na przodkach.
     function ustawPozycje(y) {
-      kandydaciPrzewijania().forEach(function (el) { el.scrollTop = y; });
-      if (Math.abs(pozycja() - y) > 2) window.scrollTo(0, y);
+      const kandydaci = kandydaciPrzewijania();
+      kandydaci.forEach(function (el) { el.scrollTop = y; });
+      let teraz = pozycja(kandydaci);
+      if (Math.abs(teraz - y) > 2) {
+        window.scrollTo(0, y);
+        teraz = pozycja(kandydaci);
+      }
+      return teraz;
     }
 
     function przywrocPozycje(y) {
@@ -2386,8 +2400,7 @@ function(t){t.__bidiEngine__=t.prototype.__bidiEngine__=function(t){var n,r,i,a,
             ' | dokument ' + el.scrollHeight + ' vs okno ' + el.clientHeight);
           return;
         }
-        ustawPozycje(y);
-        if (Math.abs(pozycja() - y) <= 2) { osiagniete = true; docelowyY = null; }
+        if (Math.abs(ustawPozycje(y) - y) <= 2) { osiagniete = true; docelowyY = null; }
         requestAnimationFrame(klatka);
       });
     }
