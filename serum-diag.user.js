@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — diagnostyka DOM (tymczasowa)
 // @namespace    local.serum-diag
-// @version      1.1.0
+// @version      1.2.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-diag.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-diag.user.js
-// @description  Sam robi zrzuty struktury strony Serum (id, klasy, tabele, ramki, liczniki) w kolejnych stanach pracy i odkłada log debug serum-ui — wszystko w localStorage — dane do dalszej optymalizacji serum-ui. Niczego nie zmienia na stronie, wyłącza się sam po 7 dniach.
+// @description  Sam robi zrzuty struktury strony Serum (id, klasy, tabele, ramki, liczniki) w kolejnych stanach pracy, co 5 min próbkuje kopie przyklejonego nagłówka, handlery okna i koszt przewijania, odkłada log debug serum-ui — wszystko w localStorage — dane do dalszej optymalizacji serum-ui. Niczego nie zmienia na stronie, wyłącza się sam po 7 dniach.
 // @match        https://s2.serum.com.pl/*
 // @noframes
 // @grant        none
@@ -126,6 +126,9 @@
       ' zn. (' + opcN + ' szt.); <textarea> ' + ta + ' zn.');
     out.push('bezpośrednie dzieci body: ' + document.body.children.length +
       ', table#fixedtableheader0 (kopie przyklejonego nagłówka): ' + document.querySelectorAll('[id="fixedtableheader0"]').length);
+    const j = jq();
+    out.push('jQuery: ' + (j && j.fn ? j.fn.jquery : 'brak') + ', window scroll: ' + grupyHandlerow(handleryJq(window, 'scroll')) +
+      '; resize: ' + grupyHandlerow(handleryJq(window, 'resize')));
     let w = document.body;
     const sc = [];
     for (let d = 0; d < 8 && w; d++) {
@@ -274,12 +277,113 @@
     try { localStorage.setItem(KLUCZ_LOG, JSON.stringify(log)); } catch (e) {}
   }
 
+  // --- przyklejony nagłówek: kopie, handlery okna, koszt przewijania (1.2) ---
+
+  // 27.10: kopie table#fixedtableheader0 rosły 9 → 373 w 2 h 20 min (Serum ich
+  // nie usuwa). Hipoteza: każde wywołanie wtyczki dokłada też handler
+  // window.scroll/resize. Próbki co 5 min odpowiadają na to wprost: liczba
+  // kopii obok liczby handlerów jQuery i czasu obsługi zdarzeń przewijania.
+  const KLUCZ_PROBKI = 'serum_diag_probki_v1';
+  const KLUCZ_KOD = 'serum_diag_kod_v1';
+  const PROBKA_CO_ILE_MS = 5 * 60000;
+  const PROBEK = 1500;               // ~tydzień pracy, ~150 B każda
+
+  const jq = () => window.jQ || window.jQuery || null;
+
+  function handleryJq(cel, typ) {
+    const j = jq();
+    if (!j || typeof j._data !== 'function') return null;
+    try { const ev = j._data(cel, 'events'); return (ev && ev[typ]) || []; } catch (e) { return null; }
+  }
+
+  // Handlery pogrupowane po początku kodu funkcji — od razu widać, który
+  // rodzaj się mnoży.
+  function grupyHandlerow(lista) {
+    if (!lista) return 'brak jQuery';
+    const g = new Map();
+    for (const h of lista) {
+      const k = maskuj(String(h.handler).replace(/\s+/g, ' ').slice(0, 90)) + (h.selector ? ' [deleg. ' + h.selector + ']' : '');
+      g.set(k, (g.get(k) || 0) + 1);
+    }
+    const out = [];
+    for (const [k, n] of g) out.push(n + '× ' + k);
+    out.sort((a, b) => parseInt(b, 10) - parseInt(a, 10));
+    return lista.length + ' (' + out.join(' | ') + ')';
+  }
+
+  // Czas obsługi przewijania okna: start w fazie przechwytywania na window
+  // (przed wszystkimi), koniec w naszym słuchaczu bąbelkowym na window, który
+  // co sprawdzenie przepinamy na koniec kolejki — jQuery dokłada swój jeden
+  // natywny słuchacz przy pierwszym .scroll(), więc mógłby być po nas.
+  // Przewijanie wewnętrznych kontenerów nie bąbelkuje do window i nie jest
+  // liczone (start bez końca jest nadpisywany).
+  let scrollStart = null;
+  let scrollCzasy = [];
+  window.addEventListener('scroll', (e) => { scrollStart = { e: e, t: performance.now() }; }, { capture: true, passive: true });
+  function koniecScrolla(e) {
+    if (!scrollStart || scrollStart.e !== e) return;
+    if (scrollCzasy.length < 3000) scrollCzasy.push(performance.now() - scrollStart.t);
+    scrollStart = null;
+  }
+  function przepnijKoniecScrolla() {
+    window.removeEventListener('scroll', koniecScrolla);
+    window.addEventListener('scroll', koniecScrolla, { passive: true });
+  }
+  przepnijKoniecScrolla();
+
+  function probka() {
+    const c = scrollCzasy;
+    scrollCzasy = [];
+    c.sort((a, b) => a - b);
+    let suma = 0, wolnych = 0;
+    for (const x of c) { suma += x; if (x > 16) wolnych++; }
+    const hs = handleryJq(window, 'scroll');
+    const hr = handleryJq(window, 'resize');
+    const p = {
+      at: Date.now(),
+      stan: poprzedni || '?',
+      kopie: document.querySelectorAll('[id="fixedtableheader0"]').length,
+      el: document.getElementsByTagName('*').length,
+      body: document.body.children.length,
+      hs: hs ? hs.length : -1,
+      hr: hr ? hr.length : -1,
+      sn: c.length,
+      ssr: c.length ? +(suma / c.length).toFixed(2) : 0,
+      s95: c.length ? +c[Math.min(c.length - 1, Math.floor(c.length * 0.95))].toFixed(1) : 0,
+      smax: c.length ? +c[c.length - 1].toFixed(1) : 0,
+      s16: wolnych,
+    };
+    let lista;
+    try { lista = JSON.parse(localStorage.getItem(KLUCZ_PROBKI) || 'null'); } catch (e) { lista = null; }
+    if (!Array.isArray(lista)) lista = [];
+    lista.push(p);
+    while (lista.length > PROBEK) lista.shift();
+    try { localStorage.setItem(KLUCZ_PROBKI, JSON.stringify(lista)); } catch (e) {}
+  }
+
+  // Kod wtyczki ze strony (nie z pamięci) — raz na wersję jQuery/wtyczki.
+  function zapiszKodWtyczki() {
+    const j = jq();
+    const f = j && j.fn && j.fn.fixedtableheader;
+    const kod = {
+      at: Date.now(),
+      jquery: j && j.fn ? j.fn.jquery : 'brak (jQ/jQuery)',
+      fixedtableheader: f ? String(f).slice(0, 12000) : 'brak jQ.fn.fixedtableheader',
+    };
+    try {
+      const stary = JSON.parse(localStorage.getItem(KLUCZ_KOD) || 'null');
+      if (stary && stary.jquery === kod.jquery && stary.fixedtableheader === kod.fixedtableheader) return;
+      localStorage.setItem(KLUCZ_KOD, JSON.stringify(kod));
+    } catch (e) {}
+  }
+
   // --- harmonogram ---
 
   let poprzedni = null;
   let zaplanowany = false;
 
   function sprawdz() {
+    przepnijKoniecScrolla();
     let stan;
     try { stan = wykryjStan(); } catch (e) { return; }
     const stabilny = stan === poprzedni;
@@ -303,6 +407,9 @@
   }
 
   setInterval(sprawdz, CO_ILE_MS);
+  setTimeout(zapiszKodWtyczki, 30000);
+  setTimeout(probka, 60000);
+  setInterval(probka, PROBKA_CO_ILE_MS);
   setTimeout(odlozLog, 60000);
   setInterval(odlozLog, LOG_CO_ILE_MS);
   window.addEventListener('pagehide', odlozLog);
