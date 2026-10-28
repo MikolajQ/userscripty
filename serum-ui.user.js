@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.123.0
+// @version      3.124.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -1278,7 +1278,21 @@
   // Okna Serum tego typu to div.przegladarka z nagłówkiem span.h3_tytul o
   // stałym id — stąd zamiast szukania tytułu w tekście wszystkich
   // div/span/h1..td wystarczy getElementById i wspięcie się do kontenera okna.
-  const POWOD_EDYCJI_TITLE_ID = 'powodEdycji';
+  // Są DWA takie okna: #powodEdycji (dokumenty, f_repo_powod_zapisz) i
+  // #powodEdycjiWizyty (zapis edytowanej wizyty, div#_uf_przegladarka2 —
+  // zrzut serum-diag 28.10). To drugie łapała dawniej tylko ścieżka awaryjna
+  // po tytule (długie ticki 42–47 ms przy „klik Zapisz” we wrześniowych
+  // logach); usunięta w 3.119 → okno znów pytało o powód.
+  const POWOD_EDYCJI_TITLE_IDS = ['powodEdycji', 'powodEdycjiWizyty'];
+  let powodEdycjiBrakLog = '';
+
+  function findPowodEdycjiTitle() {
+    for (const id of POWOD_EDYCJI_TITLE_IDS) {
+      const el = document.getElementById(id);
+      if (el && isOverlayElementVisible(el)) return el;
+    }
+    return null;
+  }
 
   function findPowodEdycjiRoot(titleEl) {
     return titleEl.closest('.przegladarka') || titleEl.closest('div, table, form, fieldset');
@@ -1335,9 +1349,10 @@
   }
 
   function modPowodEdycji() {
-    const titleEl = document.getElementById(POWOD_EDYCJI_TITLE_ID);
+    const titleEl = findPowodEdycjiTitle();
     if (!titleEl) {
       powodEdycjiDone = false;
+      powodEdycjiBrakLog = '';
       return;
     }
     if (powodEdycjiDone) return;
@@ -1345,18 +1360,27 @@
     const root = findPowodEdycjiRoot(titleEl);
     if (!root) return;
 
+    // Raz na otwarcie okna: czego zabrakło — żeby kolejna zmiana w Serum
+    // była widoczna w logu, a nie dopiero jako „znowu pyta”.
+    const brak = (co) => {
+      if (powodEdycjiBrakLog === co) return;
+      powodEdycjiBrakLog = co;
+      dbg('modPowodEdycji: #' + titleEl.id + ' bez ' + co + ' w ' + root.tagName + '#' + (root.id || '?'));
+    };
+
     const field = findPowodEdycjiField(root);
-    if (!field) return;
+    if (!field) return brak('pola');
 
     if (normLabel(field.value) !== POWOD_EDYCJI_VALUE) {
       setPowodEdycjiValue(field, POWOD_EDYCJI_VALUE);
     }
 
     const btn = findPowodEdycjiSaveButton(root);
-    if (!btn) return;
+    if (!btn) return brak('przycisku Zapisz');
 
     powodEdycjiDone = true;
-    dbg('modPowodEdycji: klik Zapisz');
+    dbg('modPowodEdycji: #' + titleEl.id + ' — klik Zapisz (' + btn.tagName +
+      ' ' + (btn.getAttribute('href') || btn.getAttribute('onclick') || '').slice(0, 60) + ')');
     btn.click();
   }
 
