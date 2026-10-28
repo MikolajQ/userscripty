@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.122.0
+// @version      3.123.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.122.0';
+  const SCRIPT_VERSION = '3.123.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -4789,10 +4789,14 @@
   // „Drukuj”/„Zapisz” do menu » na końcu paska. Od Firefoksa 157 pasek ma dwa
   // nowe przyciski (komentarz, podpis), nie mieści się w 700 px ramce
   // iframe#wydruka.printFrame i menu » ląduje za krawędzią. Samo okno
-  // (#ereferralFrame) i tak zajmuje całą szerokość strony — wystarczy poszerzyć
-  // ramkę. Czysty CSS: zero pracy w ticku.
+  // i tak zajmuje całą szerokość strony — wystarczy poszerzyć ramkę.
+  // Tę samą ramkę (id wydruka, klasa printFrame) wstawia prescriptions.js we
+  // wszystkich podglądach recept: #printElectronicPrescriptionPackage
+  // (potwierdzenie pakietu), #printPrescription, #prescriptionVer-<pakiet>
+  // — oprócz skierowań (#ereferralFrame), dlatego bez zawężania do kontenera;
+  // max-width chroni węższe miejsca. Czysty CSS: zero pracy w ticku.
   const podgladPdfStyle = document.createElement('style');
-  podgladPdfStyle.textContent = '#ereferralFrame iframe.printFrame { width: 920px !important; max-width: 100% !important; }';
+  podgladPdfStyle.textContent = 'iframe#wydruka.printFrame { width: 920px !important; max-width: 100% !important; }';
   document.documentElement.appendChild(podgladPdfStyle);
 
   let podgladWydrukuWatchTimer = null;
