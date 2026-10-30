@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.125.0
+// @version      3.126.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.125.0';
+  const SCRIPT_VERSION = '3.126.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -3034,10 +3034,135 @@
     link.click();
   }
 
-  // --- HISTORIA WIZYT: auto klik „Filtruj” po wejściu w zakładkę, potem „Rozwiń” ---
+  // --- HISTORIA WIZYT: lista wczytywana w tle od otwarcia wizyty, potem „Rozwiń” ---
+  //
+  // Pomiary 30.10.2026 (Firefox, prawdziwe Serum):
+  //  - wolne jest samo ap_wizyty_nowe_hist.historia_wizyt_lista_html: ~1 MB
+  //    HTML, TTFB 15 ms, ale przesył 13 s (logi: mediana 4 s, p90 12 s, max 35 s);
+  //  - Serum samo wczytuje sekcję historii (formularz, #wizhist_wizyty, funkcje
+  //    wizhist_*) przy otwarciu wizyty, brakuje tylko „Filtruj”;
+  //  - serwer obsługuje zapytania sesji równolegle: sondy rysuj_zakladki w
+  //    trakcie wczytywania 111–146 ms, przed 116–137 ms;
+  //  - wizhist_f_zastosuj_filtr(…, '', 'N'): 'N' = bez przesłony „Trwa
+  //    przetwarzanie danych” (f_wiz_przeslona), '' = bez wize_historia_rozwin;
+  //  - wstawienie listy w ukrytą zakładkę ~210 ms wątku, wize_hist_zwin('1')
+  //    w ukryciu 2 ms, wejście w zakładkę ~150 ms układu.
+  // Pusta lista = #wizhist_wizyty bez dzieci (zmierzone), wypełniona = 1 dziecko.
 
-  let historiaFiltrDone = false;
+  // Kod strony: strażnik odpowiedzi wczytywanej w tle. Bez przesłony lekarz
+  // może zamknąć wizytę w trakcie wczytywania, a callback Serum
+  // (wizhist_fr_zastosuj_filtr) wstawia listę do #wizhist_wizyty, który akurat
+  // jest w DOM — czyli do historii NASTĘPNEGO pacjenta. Odpowiedź trafia więc
+  // do Serum tylko wtedy, gdy lista i wizyta są te same co przy wysłaniu.
+  // Przy okazji wstawienie (~210 ms) czeka, aż lekarz przestanie pisać (1 s
+  // bez klawisza) albo wejdzie w zakładkę.
+  function historiaWTleStronie() {
+    if (window.__serumUiHistoriaWTle) return;
+    var proto = XMLHttpRequest.prototype;
+    var open = proto.open;
+    var send = proto.send;
+    var RE = /(?:^|\/)ap_wizyty_nowe_hist\.historia_wizyt_lista_html\b/;
+    var zadanie = null;
+    var podpiety = false;
+    var nr = 0;
+    var ostatniKlawisz = 0;
+    function naKlawisz() { ostatniKlawisz = performance.now(); }
+    function kluczWizyty() {
+      var p = document.getElementById('wizhist_hid_idpacjenta');
+      var k = document.getElementById('wizhist_hid_idkontaktu');
+      return (p ? p.value : '') + '|' + (k ? k.value : '');
+    }
+    function zakladkaWidoczna() {
+      var s = document.getElementById('wize_sekcja_historia');
+      return !!s && s.getClientRects().length > 0;
+    }
+    function emit(nrZadania, tekst) {
+      try {
+        document.dispatchEvent(new CustomEvent('serum-historia-tlo', { detail: nrZadania + '\t' + tekst }));
+      } catch (e) {}
+    }
+    proto.open = function (method, url) {
+      this.__serumHistoria = RE.test(String(url));
+      return open.apply(this, arguments);
+    };
+    proto.send = function () {
+      if (zadanie !== null && this.__serumHistoria) {
+        podpiety = true;
+        var dla = zadanie;
+        var xhr = this;
+        var t0 = performance.now();
+        var oryg = xhr.onreadystatechange;
+        document.addEventListener('keydown', naKlawisz, true);
+        xhr.onreadystatechange = function () {
+          if (xhr.readyState !== 4 || typeof oryg !== 'function') {
+            return typeof oryg === 'function' ? oryg.apply(this, arguments) : undefined;
+          }
+          var args = arguments;
+          var tOdp = performance.now();
+          var wstaw = function () {
+            if (document.getElementById('wizhist_wizyty') !== dla.lista || kluczWizyty() !== dla.klucz) {
+              document.removeEventListener('keydown', naKlawisz, true);
+              emit(dla.nr, 'odrzucono — w międzyczasie otwarto inną wizytę');
+              return;
+            }
+            if (xhr.status !== 200) {
+              // Błąd w tle bez alertu Serum na DANE WIZYTY — przy wejściu w
+              // zakładkę idzie zwykły „Filtruj” i wtedy Serum powie, co jest.
+              document.removeEventListener('keydown', naKlawisz, true);
+              emit(dla.nr, 'HTTP ' + xhr.status + ' po ' + ((tOdp - t0) / 1000).toFixed(1) + ' s — bez komunikatu');
+              return;
+            }
+            var teraz = performance.now();
+            if (teraz - ostatniKlawisz < 1000 && teraz - tOdp < 120000 && !zakladkaWidoczna()) {
+              setTimeout(wstaw, 300);
+              return;
+            }
+            document.removeEventListener('keydown', naKlawisz, true);
+            var tw = performance.now();
+            var blad = '';
+            try { oryg.apply(xhr, args); } catch (e) { blad = ', wyjątek callbacku: ' + (e && e.message || e); }
+            var dl = 0;
+            try { dl = (xhr.responseText || '').length; } catch (e) {}
+            emit(dla.nr, 'wstawiono po ' + ((tOdp - t0) / 1000).toFixed(1) + ' s, ' + dl + ' zn., wstawienie ' +
+              (performance.now() - tw).toFixed(0) + ' ms' +
+              (tw - tOdp > 50 ? ', odroczone o ' + ((tw - tOdp) / 1000).toFixed(1) + ' s (pisanie)' : '') + blad);
+          };
+          wstaw();
+        };
+      }
+      return send.apply(this, arguments);
+    };
+    window.__serumUiHistoriaWTle = function () {
+      if (typeof window.wizhist_f_zastosuj_filtr !== 'function') return 'brak wizhist_f_zastosuj_filtr';
+      nr++;
+      zadanie = { lista: document.getElementById('wizhist_wizyty'), klucz: kluczWizyty(), nr: nr };
+      podpiety = false;
+      try {
+        window.wizhist_f_zastosuj_filtr(undefined, '', 'N');
+      } catch (e) {
+        return 'wyjątek: ' + (e && e.message || e);
+      } finally {
+        zadanie = null;
+      }
+      return (podpiety ? 'OK ' : 'bez strażnika ') + nr;
+    };
+  }
+
+  wstrzyknijDoStrony(historiaWTleStronie);
+
+  // Limit na wypadek zawieszonego zapytania (zdarzenie ze strony nie przyszło).
+  const HISTORIA_TLO_LIMIT_MS = 180_000;
+
+  let historiaLista = null;        // #wizhist_wizyty, którego dotyczy stan poniżej
+  let historiaKlucz = '';          // idpacjenta|idkontaktu tej listy
+  let historiaFiltrBtn = null;
+  let historiaFiltrDone = false;   // lista zamówiona (w tle albo klikiem Filtruj)
   let historiaRozwinDone = false;
+  let historiaTloOd = 0;           // start wczytywania w tle; 0 = nic nie wisi
+  let historiaTloNr = 0;           // numer zapytania w tle (zdarzenia ze strony)
+  let historiaTloNieudane = false; // dla tej listy już tylko klik „Filtruj”
+  let historiaTloWylaczone = false; // strażnik się nie podpiął — do końca sesji stara ścieżka
+  let historiaToastPokazany = false;
 
   function findHistoriaFiltrButton() {
     // Dopasowanie po fragmencie href (konkretna funkcja JS strony) jest dużo
@@ -3052,45 +3177,130 @@
     return document.querySelector('a[href*="wize_hist_zwin(\'1\'"]');
   }
 
-  function isHistoriaWizytListEmpty() {
-    // Każdy wiersz wyniku zaczyna się od „Wizyta z dnia: ...” — jeśli tego
-    // tekstu nigdzie nie ma, dolna sekcja jest jeszcze pusta (nie filtrowano).
-    // Liczone tylko w zakładce HISTORIA WIZYT, do chwili kliknięcia Filtruj
-    // i Rozwiń (patrz modHistoriaWizytFiltr).
-    return !/wizyta\s+z\s+dnia/i.test(document.body?.textContent || '');
+  function kluczWizytyHistorii() {
+    return (document.getElementById('wizhist_hid_idpacjenta')?.value || '') + '|' +
+      (document.getElementById('wizhist_hid_idkontaktu')?.value || '');
   }
 
-  function modHistoriaWizytFiltr() {
-    const btn = findHistoriaFiltrButton();
-    if (!isOverlayElementVisible(btn)) {
+  // Te same pola, których Serum wymaga przed wejściem w zakładkę HISTORIA
+  // (wize_f_zmien_typ_wizyty: „Proszę wybrać komórkę, pacjenta i personel.”).
+  function wizytaGotowaDoHistorii() {
+    if (!document.getElementById('wizhist_hid_idpacjenta')?.value) return false;
+    if (document.getElementById('wize_zakladka_historia')?.getAttribute('pobieram') === 'T') return false;
+    for (const id of ['wiz_e_pacjent_w', 'wiz_e_personel_w', 'wize_komorka_w']) {
+      if (!document.getElementById(id)?.value) return false;
+    }
+    return true;
+  }
+
+  document.addEventListener('serum-historia-tlo', (e) => {
+    const [nr, tekst] = String(e.detail || '').split('\t');
+    const tej = Number(nr) === historiaTloNr && historiaTloOd > 0;
+    dbg('modHistoriaWizytFiltr: tło — ' + tekst + (tej ? '' : ' (inna lista — bez zmian)'));
+    if (!tej) return;
+    historiaTloOd = 0;
+    if (!/^wstawiono/.test(tekst)) {
+      // Lista nie przyszła — przy wejściu w zakładkę zwykły klik „Filtruj”.
+      historiaTloNieudane = true;
       historiaFiltrDone = false;
-      historiaRozwinDone = false;
+    }
+    scheduleUi();
+  });
+
+  function modHistoriaWizytFiltr() {
+    const lista = document.getElementById('wizhist_wizyty');
+    if (!lista) {
+      historiaLista = null;
       return;
     }
-
-    if (!historiaFiltrDone) {
-      if (!isHistoriaWizytListEmpty()) {
-        // Lista wyników już jest wypełniona (np. po przełączeniu się między
-        // zakładkami) — nie klikamy ponownie, żeby nie zresetować wyniku, i
-        // nie ruszamy też „Rozwiń” (mogło być już ręcznie zwinięte/rozwinięte).
+    const klucz = kluczWizytyHistorii();
+    if (lista !== historiaLista || klucz !== historiaKlucz) {
+      historiaLista = lista;
+      historiaKlucz = klucz;
+      historiaFiltrBtn = null;
+      historiaFiltrDone = false;
+      historiaRozwinDone = false;
+      historiaTloOd = 0;
+      historiaTloNr = 0;
+      historiaTloNieudane = false;
+      historiaToastPokazany = false;
+      if (lista.firstChild) {
+        // Lista już wypełniona, zanim ją zobaczyliśmy — nie nasza, nie ruszamy
+        // (mogła być ręcznie przefiltrowana albo zwinięta).
         historiaFiltrDone = true;
         historiaRozwinDone = true;
         return;
       }
+    }
+    if (historiaRozwinDone) return;
+
+    if (!lista.firstChild) {
+      if (historiaTloOd) {
+        if (Date.now() - historiaTloOd > HISTORIA_TLO_LIMIT_MS) {
+          dbg('modHistoriaWizytFiltr: brak listy z tła po ' + (HISTORIA_TLO_LIMIT_MS / 1000) + ' s — przy wejściu zwykły „Filtruj”');
+          historiaTloOd = 0;
+          historiaTloNieudane = true;
+          historiaFiltrDone = false;
+        } else {
+          if (!historiaToastPokazany) {
+            if (!historiaFiltrBtn?.isConnected) historiaFiltrBtn = findHistoriaFiltrButton();
+            if (isOverlayElementVisible(historiaFiltrBtn)) {
+              historiaToastPokazany = true;
+              showToast('Historia wizyt wczytuje się w tle (' + Math.round((Date.now() - historiaTloOd) / 1000) + ' s)…', { durationMs: 4000 });
+            }
+          }
+          return;
+        }
+      }
+      if (historiaFiltrDone) return; // kliknięty „Filtruj” — czekamy na listę
+
+      if (!historiaFiltrBtn?.isConnected) historiaFiltrBtn = findHistoriaFiltrButton();
+      const widoczny = isOverlayElementVisible(historiaFiltrBtn);
+      if (!widoczny && !historiaTloNieudane && !historiaTloWylaczone && wizytaGotowaDoHistorii()) {
+        const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+        let wynik;
+        try { wynik = uw.__serumUiHistoriaWTle?.() ?? 'brak kodu strony'; }
+        catch (e) { wynik = 'wyjątek: ' + (e?.message || e); }
+        const m = /^(OK|bez strażnika) (\d+)$/.exec(wynik);
+        if (m) {
+          // Zapytanie poszło — czekamy na listę (zdarzenie ze strony albo limit).
+          historiaFiltrDone = true;
+          historiaTloOd = Date.now();
+          historiaTloNr = Number(m[2]);
+          zaplanujTickZa(HISTORIA_TLO_LIMIT_MS + 1000);
+        } else {
+          historiaTloNieudane = true;
+        }
+        if (m?.[1] === 'bez strażnika') {
+          // Zapytanie poszło innym torem (serum2?) i nic nie pilnuje, do
+          // której wizyty trafi lista — do przeładowania stara ścieżka.
+          historiaTloWylaczone = true;
+          dbg('modHistoriaWizytFiltr: wczytywanie w tle bez strażnika odpowiedzi — wyłączone do przeładowania strony');
+        } else {
+          dbg('modHistoriaWizytFiltr: ' + (m ? 'wczytuję listę HISTORIA WIZYT w tle (bez przesłony)' : 'wczytywanie w tle — ' + wynik));
+        }
+        return;
+      }
+      if (!widoczny) return;
       historiaFiltrDone = true;
       dbg('modHistoriaWizytFiltr: klik „Filtruj” po wejściu w zakładkę HISTORIA WIZYT');
-      btn.click();
+      historiaFiltrBtn.click();
       return;
     }
 
-    if (historiaRozwinDone) return;
-    if (isHistoriaWizytListEmpty()) return; // czekamy aż lista się wypełni po filtrowaniu
-
-    const rozwinBtn = findHistoriaRozwinButton();
-    if (!isOverlayElementVisible(rozwinBtn)) return; // spróbuj ponownie przy kolejnym ticku
+    // Lista jest. Rozwijamy od razu, także w ukrytej zakładce (2 ms, bez układu).
     historiaRozwinDone = true;
-    dbg('modHistoriaWizytFiltr: klik „Rozwiń wszystkie” po przefiltrowaniu listy HISTORIA WIZYT');
-    rozwinBtn.click();
+    const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    if (typeof uw.wize_hist_zwin === 'function') {
+      uw.wize_hist_zwin('1');
+      dbg('modHistoriaWizytFiltr: „Rozwiń wszystkie” (wize_hist_zwin) po wczytaniu listy HISTORIA WIZYT');
+      return;
+    }
+    const rozwinBtn = findHistoriaRozwinButton();
+    if (rozwinBtn) {
+      dbg('modHistoriaWizytFiltr: klik „Rozwiń wszystkie” po wczytaniu listy HISTORIA WIZYT');
+      rozwinBtn.click();
+    }
   }
 
   // Pole „Pacjent” z panelu Edycji wizyty. Dawniej obsługiwało też kopiowanie
