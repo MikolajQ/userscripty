@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.124.0
+// @version      3.125.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz, LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, auto Filtruj + Rozwiń w Historii wizyt, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.123.0';
+  const SCRIPT_VERSION = '3.125.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -722,11 +722,17 @@
   // (kropki tylko przez CSS -webkit-text-security), więc menedżer haseł go
   // już nie wypełnia. Trzymamy go w pamięci Tampermonkeya, jak PIN do PUE —
   // pytamy raz, przy pierwszej potrzebie; zmiana przez menu.
+  // Ten sam PIN podpisuje w Serum wszystko: e-recepty, IPOM i dokumenty CDA.
   const KLUCZ_PODPIS_PIN = 'serum_podpis_pin';
   let podpisPinPytano = false;
+  // Ustawiane, gdy podpis CDA z PIN-em wpisanym przez skrypt wróci z odpowiedzią
+  // inną niż „OK”. Przy złym PIN-ie każde kolejne okno byłoby kolejną nieudaną
+  // próbą — prosta droga do blokady certyfikatu. Jak przy PUE: zdejmuje to
+  // zapisanie PIN-u z menu albo przeładowanie strony.
+  let cdaAutoPinWstrzymany = false;
 
   function zapytajOPodpisPin() {
-    const wpisany = window.prompt('PIN do podpisu e-recept/IPOM (Serum) — zostanie zapamiętany w Tampermonkey:', '');
+    const wpisany = window.prompt('PIN do podpisów w Serum (e-recepty, IPOM, dokumenty) — zostanie zapamiętany w Tampermonkey:', '');
     if (wpisany == null) return '';
     const kod = wpisany.trim();
     if (!/^\d{4,}$/.test(kod)) {
@@ -734,6 +740,7 @@
       return '';
     }
     GM_setValue(KLUCZ_PODPIS_PIN, kod);
+    cdaAutoPinWstrzymany = false;
     return kod;
   }
 
@@ -745,26 +752,28 @@
     return zapytajOPodpisPin();
   }
 
-  GM_registerMenuCommand?.('Ustaw PIN do podpisu e-recept (Serum)', () => {
-    if (zapytajOPodpisPin()) window.alert('Zapisano PIN do podpisu e-recept.');
+  GM_registerMenuCommand?.('Ustaw PIN do podpisów (Serum)', () => {
+    if (zapytajOPodpisPin()) window.alert('Zapisano PIN do podpisów.');
   });
 
   // Wpisuje PIN raz na pojawienie się pola (WeakSet) i tylko do pustego —
   // jeśli ktoś go skasuje/poprawi ręcznie, nie nadpisujemy.
+  // Zwraca true, gdy PIN został wpisany w tym wywołaniu.
   const wypelnionePolaPin = new WeakSet();
   function wpiszPodpisPin(pin, modul) {
-    if (wypelnionePolaPin.has(pin)) return;
+    if (wypelnionePolaPin.has(pin)) return false;
     wypelnionePolaPin.add(pin);
-    if (pin.value.trim()) return;
+    if (pin.value.trim()) return false;
     const kod = podpisPin();
     if (!kod) {
       dbg(modul + ': brak zapisanego PIN-u do podpisu — wpisz ręcznie lub ustaw w menu');
-      return;
+      return false;
     }
     pin.value = kod;
     pin.dispatchEvent(new Event('input', { bubbles: true }));
     pin.dispatchEvent(new Event('change', { bubbles: true }));
     dbg(modul + ': wpisano zapamiętany PIN');
+    return true;
   }
 
   function modPodpiszERecepte() {
@@ -1441,13 +1450,23 @@
     document.addEventListener('serum-sms-sent', showSmsToast, false);
   }
 
-  // --- PODPIS ELEKTRONICZNY (CDA): PIN zapamiętany przez przeglądarkę → klik „Podpisz” ---
+  // --- PODPIS ELEKTRONICZNY (CDA): PIN + „Zapamiętaj” → klik „Podpisz” ---
 
   // Potwierdzone inspektorem w panelu „PODPIS ELEKTRONICZNY”:
   //   <input id="inp_cda_pin" class="cda_podpis naprawione" type="password" …>
   //   <input id="chkb_cda_pin_zap" type="checkbox">  + <label for="chkb_cda_pin_zap">Zapamiętaj</label>
   //   <a class="a_akc cda_podpis" onclick="f_cda_podpis(…)">Podpisz</a>
   //   <a class="a_akc" onclick="f_cda_zamknij(…)">Zamknij</a>
+  // Kod Serum (funkcje strony zrzucone z konsoli 30.10.2026):
+  //   f_cda_podpis()      → czyta tylko jQ("#inp_cda_pin").val() i
+  //                         jQ("#chkb_cda_pin_zap").is(":checked") (→ [[606]]T,
+  //                         PIN zapamiętuje serwer) i woła uf_ajax("ap_cda.podpis")
+  //   fr_cda_podpis(rTxt) → „OK”: alert „Dokument został podpisany.” (zamyka go
+  //                         dialogiStrony) + uf_schowaj_div(); inaczej alert(rTxt)
+  //                         i panel zostaje otwarty
+  // Po pierwszym podpisie z „Zapamiętaj” Serum samo podaje w kolejnych panelach
+  // wypełnione pole i zaznaczony checkbox. Do tego czasu (pierwszy podpis po
+  // zalogowaniu) PIN i „Zapamiętaj” ustawia skrypt — ten sam PIN co do e-recept.
   // Logi 08–28.09.2026: 184 z 184 automatycznych podpisów poszło tą ścieżką
   // (panel w logu bez tytułu = panel z a.cda_podpis). Dawna heurystyka —
   // tytuł w tekście całego <body> i ramek iframe, przyciski „Podpisz” szukane
@@ -1475,14 +1494,58 @@
     return !!(attr && attr.length > 0);
   }
 
+  // Wynik podpisu: uf_ajax przekazuje callback jako tekst
+  // („fr_cda_podpis(rTxt, …)”) do eval albo ser.ufAjaxCallback, więc podmiana
+  // globalnej funkcji łapie odpowiedź bez względu na to, czy żądanie poszło
+  // zwykłym XHR, czy przez serum2. fr_cda_podpis_cykliczne to ten sam wynik
+  // przy podpisie kilku dokumentów naraz (f_cda_podpis_wiele, to samo pole PIN).
+  // Owijane przy każdym kliknięciu „Podpisz” — gdyby Serum zdefiniowało funkcję
+  // od nowa, owinięcie wraca.
+  function podsluchCdaPodpis() {
+    var nazwy = ['fr_cda_podpis', 'fr_cda_podpis_cykliczne'];
+    for (var i = 0; i < nazwy.length; i++) {
+      var orig = window[nazwy[i]];
+      if (typeof orig !== 'function' || orig.__serumUi) continue;
+      var owinieta = (function (orig) {
+        return function (rTxt) {
+          try { document.dispatchEvent(new CustomEvent('serum-cda-podpis', { detail: String(rTxt) })); } catch (e) {}
+          return orig.apply(this, arguments);
+        };
+      })(orig);
+      owinieta.__serumUi = true;
+      window[nazwy[i]] = owinieta;
+    }
+  }
+
+  let cdaPinWpisanyDo = null; // pole, do którego PIN wpisał skrypt
+  let cdaAutoPinWToku = false; // wysłany podpis z PIN-em od skryptu czeka na wynik
+
+  document.addEventListener('serum-cda-podpis', (e) => {
+    const rTxt = String(e.detail);
+    const autoPin = cdaAutoPinWToku;
+    cdaAutoPinWToku = false;
+    if (rTxt === 'OK') {
+      if (autoPin) dbg('modPodpisElektroniczny: podpisano z PIN-em od skryptu, Serum zapamiętało PIN');
+      return;
+    }
+    if (autoPin) cdaAutoPinWstrzymany = true;
+    dbg('modPodpisElektroniczny: podpis odrzucony „' + rTxt.slice(0, 160) + '”' +
+      (autoPin ? '; auto-PIN wstrzymany do zapisania PIN-u z menu albo przeładowania strony' : ''));
+  });
+
   function modPodpisElektroniczny() {
     const pin = document.getElementById('inp_cda_pin');
     if (!pin) {
       clickedPodpis = false;
       return;
     }
-    if (clickedPodpis || !isPodpisVisible(pin) || !fieldHasValue(pin)) return;
-    if (!document.getElementById('chkb_cda_pin_zap')?.checked) return;
+    if (clickedPodpis || !isPodpisVisible(pin)) return;
+    const zap = document.getElementById('chkb_cda_pin_zap');
+    if (zap && !cdaAutoPinWstrzymany && wpiszPodpisPin(pin, 'modPodpisElektroniczny')) {
+      zap.checked = true;
+      cdaPinWpisanyDo = pin;
+    }
+    if (!fieldHasValue(pin) || !zap?.checked) return;
 
     // Klasa cda_podpis odróżnia „Podpisz” od sąsiedniego „Zamknij”
     // (oba mają klasę a_akc i identyczny wygląd).
@@ -1490,8 +1553,11 @@
     if (!signBtn) return;
 
     clickedPodpis = true;
+    cdaAutoPinWToku = pin === cdaPinWpisanyDo;
+    wstrzyknijDoStrony(podsluchCdaPodpis);
     const panel = signBtn.closest('table, form, div') || signBtn.parentElement;
-    dbg('modPodpisElektroniczny: klik Podpisz, panel="' + normLabel(panel?.textContent).slice(0, 80) + '"');
+    dbg('modPodpisElektroniczny: klik Podpisz' + (cdaAutoPinWToku ? ' (PIN od skryptu)' : '') +
+      ', panel="' + normLabel(panel?.textContent).slice(0, 80) + '"');
     try { signBtn.focus?.(); } catch (_) {}
     signBtn.click();
   }
