@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.126.0
+// @version      3.127.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -1566,7 +1566,7 @@
   // Ubezpieczyciele/abonamenty, przy których świadczenia NIE zapisujemy do NFZ.
   // „Compensa” po rdzeniu (\bcompens) — łapie odmiany: Compensy, Compensie,
   // Compensą. Polska „kompensacja” pisze się przez k, więc nie koliduje.
-  const TRIGGER_RES = [/lux\s*[- ]?\s*med|luxmed/i, /enel\s*[- ]?\s*med|enelmed/i, /\bpzu\b/i, /\bprywatna\b/i, /medicover/i, /200\s*zł/i, /polmed/i, /\bcompens/i];
+  const TRIGGER_RES = [/lux\s*[- ]?\s*med|luxmed/i, /enel\s*[- ]?\s*med|enelmed/i, /\bpzu\b/i, /\bprywatna\b/i, /medicover/i, /200\s*zł/i, /polmed/i, /\bcompens/i, /[śs]wiat\s*zdrowia/i];
   const luxCache = { uwagi: null, checkbox: null };
   let luxDone = false;
 
