@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.127.0
+// @version      3.128.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -2695,7 +2695,10 @@
         const dane = JSON.parse(raw);
         const n = Number(dane?.n) || 0;
         const t = Number(dane?.t) || 0;
-        if (!n || Date.now() - t > SERIA_OKNO_MS) { zerujProby(); return 0; }
+        // od < 0: próba zapisana przy zegarze do przodu (RTC przed NTP) —
+        // bez tego seria nie wygasałaby, dopóki zegar jej nie dogoni.
+        const od = Date.now() - t;
+        if (!n || od < 0 || od > SERIA_OKNO_MS) { zerujProby(); return 0; }
         return n;
       } catch (_) { zerujProby(); return 0; }
     }
@@ -3016,7 +3019,12 @@
     }
     let ostatni = 0;
     try { ostatni = Number(sessionStorage.getItem(KLUCZ_DASHBOARD_KLIK)) || 0; } catch (e) {}
-    if (Date.now() - ostatni < 60_000) {
+    // Znacznik z przyszłości (od < 0) = zegar cofnięty po kliku, nie pętla.
+    // 02.11: OptiPlex wstał z RTC ~1 h do przodu, klik zapisał 14:58:36,
+    // NTP cofnęło zegar na 13:59, a sessionStorage przetrwało restarty
+    // Firefoksa — auto klik stał do 14:59 („różnica” ujemna < 60 s).
+    const od = Date.now() - ostatni;
+    if (od >= 0 && od < 60_000) {
       dashboardNavDone = true;
       dbg('modDashboardNav: powrót na stronę startową tuż po auto kliku — nie klikam ponownie (pętla?)');
       return;
