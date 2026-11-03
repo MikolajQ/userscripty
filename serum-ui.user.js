@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.129.0
+// @version      3.129.1
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.129.0';
+  const SCRIPT_VERSION = '3.129.1';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -733,7 +733,7 @@
   let cdaAutoPinWstrzymany = false;
 
   function zapytajOPodpisPin() {
-    const wpisany = window.prompt('PIN do podpisów w Serum (e-recepty, IPOM, dokumenty) — zostanie zapamiętany w Tampermonkey:', '');
+    const wpisany = window.prompt('PIN do podpisów w Serum (e-recepty, IPOM, dokumenty) — zostanie zapamiętany w menedżerze skryptów (Violentmonkey):', '');
     if (wpisany == null) return '';
     const kod = wpisany.trim();
     if (!/^\d{4,}$/.test(kod)) {
@@ -845,7 +845,7 @@
   let pueAutoPinWstrzymany = false;
 
   function zapytajOPuePin() {
-    const wpisany = window.prompt('PIN do PUE ZUS (Serum) — zostanie zapamiętany w Tampermonkey:', '');
+    const wpisany = window.prompt('PIN do PUE ZUS (Serum) — zostanie zapamiętany w menedżerze skryptów (Violentmonkey):', '');
     if (wpisany == null) return '';
     const kod = wpisany.trim();
     if (!/^\d{4,}$/.test(kod)) {

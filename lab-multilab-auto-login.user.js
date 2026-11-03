@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Multilab — auto logowanie (tczew)
 // @namespace    local.lab-multilab-auto-login
-// @version      1.0.0
+// @version      1.0.1
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/lab-multilab-auto-login.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/lab-multilab-auto-login.user.js
-// @description  Auto wypełnienie i wysłanie formularza logowania (PESEL + PIN) zapamiętanego przez Tampermonkey
+// @description  Auto wypełnienie i wysłanie formularza logowania (PESEL + PIN) zapamiętanego w menedżerze skryptów (Violentmonkey)
 // @match        https://10.1.1.140/page,login*
 // @match        http://10.1.1.140/page,login*
 // @grant        GM_setValue
@@ -106,7 +106,7 @@
     const pesel = typeof GM_getValue === 'function' ? GM_getValue(STORE_KEY_PESEL, '') : '';
     const pin = typeof GM_getValue === 'function' ? GM_getValue(STORE_KEY_PIN, '') : '';
     if (!pesel || !pin) {
-      dbg('tryLogin: brak zapisanych danych logowania (użyj menu Tampermonkey „Ustaw dane logowania”)');
+      dbg('tryLogin: brak zapisanych danych logowania (użyj menu menedżera skryptów „Ustaw dane logowania”)');
       attempted = true;
       return;
     }

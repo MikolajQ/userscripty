@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         NFZ — kod świadczeniodawcy przy logowaniu
 // @namespace    local.nfz-kod-swiadczeniodawcy
-// @version      1.0.0
+// @version      1.0.1
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/nfz-kod-swiadczeniodawcy.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/nfz-kod-swiadczeniodawcy.user.js
-// @description  Logowanie NFZ (dt.nfz.gov.pl): wpisuje zapamiętany kod świadczeniodawcy w puste pole. Kod ustawia się z menu Tampermonkeya.
+// @description  Logowanie NFZ (dt.nfz.gov.pl): wpisuje zapamiętany kod świadczeniodawcy w puste pole. Kod ustawia się z menu menedżera skryptów (Violentmonkey).
 // @match        https://dt.nfz.gov.pl/ap-idp-mfa/user/auth/*
 // @grant        GM_getValue
 // @grant        GM_setValue
