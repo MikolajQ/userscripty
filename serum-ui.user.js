@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.129.1
+// @version      3.130.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.129.1';
+  const SCRIPT_VERSION = '3.130.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -5247,6 +5247,191 @@
   podgladPdfStyle.textContent = 'iframe#wydruka.printFrame { width: 920px !important; max-width: 100% !important; }';
   document.documentElement.appendChild(podgladPdfStyle);
 
+  // --- Diagnostyka podglądu wydruku (3.130) ---
+  // 03.11 zgłoszone: czasem podgląd „Zalecenia” / „Skierowanie do laboratorium”
+  // w Firefoksie (iframe#wydruka → /pdf/wydruk_xml_fo/*.pdf, wbudowana
+  // przeglądarka PDF) jest cały czarny, bez treści. Zdarza się rzadko, więc
+  // bez zgadywania: każdy podgląd zostawia jedną linię (wczytanie ramki,
+  // Resource Timing PDF-a, rozmiar ramki, zabrany fokus, przerwy wątku,
+  // sposób zamknięcia), a z menu „Podgląd wydruku czarny — zapisz stan” idzie
+  // pełny zrzut tej chwili. Wnętrze ramki PDF jest dla strony niedostępne
+  // (zrzuty serum-diag: dostęp=nie), więc zrzut opisuje wszystko wokół niej:
+  // co leży na jej środku, style przodków, duplikaty #wydruka, przesłony,
+  // kopię PDF-a z pamięci podręcznej (only-if-cached, bez sieci).
+  // Zapis w localStorage strony (czytaj-diag.py --podglad), niezależnie od
+  // bufora logu i od serum-diag. Koszt tylko przy otwartym podglądzie.
+  const PODGLAD_DIAG_KLUCZ = 'serum_ui_podglad_v1';
+  let podgladDiag = null;
+
+  function opisEl(el) {
+    if (!el || el.nodeType !== 1) return String(el);
+    let s = el.tagName.toLowerCase() + (el.id ? '#' + el.id : '');
+    for (let i = 0; i < el.classList.length && i < 3; i++) s += '.' + el.classList[i];
+    return s;
+  }
+  function rectTxt(el) {
+    if (!el?.isConnected) return 'poza dokumentem';
+    const r = el.getBoundingClientRect();
+    return Math.round(r.width) + '×' + Math.round(r.height) + ' @' + Math.round(r.left) + ',' + Math.round(r.top);
+  }
+  function srcTxt(src) {
+    return String(src || '').replace(/^https:\/\/[^/]+/, '').slice(0, 120) || '(pusty)';
+  }
+  function rtTxt(e) {
+    let s = e.initiatorType + ' ' + srcTxt(e.name) + ': ' + Math.round(e.duration) + ' ms';
+    if (e.responseStart > 0 && e.requestStart > 0) s += ' (serwer ' + Math.round(e.responseStart - e.requestStart) + ' ms)';
+    s += ', ' + e.encodedBodySize + ' B';
+    if (e.decodedBodySize && e.decodedBodySize !== e.encodedBodySize) s += ' (rozp. ' + e.decodedBodySize + ' B)';
+    if (e.transferSize === 0 && e.encodedBodySize > 0) s += ', z pamięci podręcznej';
+    if (e.responseStatus) s += ', HTTP ' + e.responseStatus;
+    // Dla ramki z PDF-em Firefox podaje tu text/html (dokument przeglądarki
+    // PDF, sprawdzone w teście), więc to nie jest typ odpowiedzi serwera.
+    if (e.contentType) s += ', typ RT ' + e.contentType;
+    return s;
+  }
+  function podgladRamka(heading) {
+    const kont = heading?.closest?.('.przegladarka, .popup-window') || heading;
+    return kont?.querySelector?.('iframe') || null;
+  }
+  function podgladDiagZapisz(rodzaj, txt) {
+    try {
+      let d = JSON.parse(localStorage.getItem(PODGLAD_DIAG_KLUCZ) || 'null');
+      if (!d || typeof d !== 'object') d = {};
+      const lista = Array.isArray(d[rodzaj]) ? d[rodzaj] : [];
+      lista.push({ at: Date.now(), txt: txt });
+      while (lista.length > (rodzaj === 'zrzuty' ? 8 : 60)) lista.shift();
+      d[rodzaj] = lista;
+      localStorage.setItem(PODGLAD_DIAG_KLUCZ, JSON.stringify(d));
+    } catch (_) {}
+  }
+  function podgladZamkniecie(powod) {
+    if (podgladDiag) podgladDiag.zamkniecie = powod;
+  }
+  function podgladDiagOpis(d) {
+    return 'ramka na starcie ' + d.rectStart + '; load: ' + (d.loady.join(' | ') || 'brak w trakcie podglądu') +
+      '; PDF: ' + (d.rt.join(' | ') || 'brak wpisu Resource Timing') +
+      '; fokus zabrany ' + d.blur + '×, max przerwa wątku ' + d.maxPrzerwa + ' ms';
+  }
+
+  function podgladDiagStart(heading) {
+    const ramka = podgladRamka(heading);
+    const d = {
+      t0: performance.now(), okno: opisEl(heading), ramka: ramka, src: ramka ? srcTxt(ramka.src) : 'brak ramki',
+      rectStart: rectTxt(ramka), loady: [], rt: [], blur: 0, maxPrzerwa: 0, zamkniecie: '', po: null, onLoad: null,
+    };
+    podgladDiag = d;
+    if (!ramka) return;
+    d.onLoad = () => {
+      if (d.loady.length < 5) {
+        d.loady.push(Math.round(performance.now() - d.t0) + ' ms, ' + srcTxt(ramka.src) + ', ' + rectTxt(ramka) +
+          (isOverlayElementVisible(ramka) ? '' : ', NIEWIDOCZNA'));
+      }
+    };
+    ramka.addEventListener('load', d.onLoad);
+    try {
+      // Wpis sprzed otwarcia (szybki PDF albo poprzedni podgląd z tym samym
+      // adresem — stąd wiek). Bufor Resource Timing ma 250 miejsc i po
+      // zapełnieniu nie przyjmuje nowych, obserwator dostaje je mimo to.
+      const stare = performance.getEntriesByName(ramka.src);
+      const e = stare[stare.length - 1];
+      if (e) d.rt.push('sprzed ' + ((d.t0 - e.responseEnd) / 1000).toFixed(1) + ' s: ' + rtTxt(e));
+      d.po = new PerformanceObserver((lista) => {
+        for (const w of lista.getEntries()) {
+          if (d.rt.length < 6 && (w.name === ramka.src || w.initiatorType === 'iframe' || /\/pdf\//.test(w.name))) d.rt.push(rtTxt(w));
+        }
+      });
+      d.po.observe({ type: 'resource' });
+    } catch (_) {}
+  }
+
+  function podgladDiagKoniec() {
+    const d = podgladDiag;
+    if (!d) return;
+    podgladDiag = null;
+    try { d.po?.disconnect(); } catch (_) {}
+    if (d.ramka && d.onLoad) d.ramka.removeEventListener('load', d.onLoad);
+    const txt = d.okno + ' ' + d.src + ': otwarty ' + ((performance.now() - d.t0) / 1000).toFixed(1) + ' s, ' +
+      podgladDiagOpis(d) + '; zamknięcie: ' + (d.zamkniecie || 'Serum/użytkownik');
+    dbg('podglądWydruku: ' + txt);
+    podgladDiagZapisz('podglady', txt);
+  }
+
+  function podgladZrzut() {
+    const heading = findPodgladWydrukuHeading();
+    const d = podgladDiag;
+    const ramka = heading ? podgladRamka(heading) : null;
+    const L = [];
+    L.push('podgląd: ' + (heading ? opisEl(heading) : 'NIE WYKRYTY') + (d ? ', otwarty ' + ((performance.now() - d.t0) / 1000).toFixed(1) + ' s temu; ' + podgladDiagOpis(d) : ''));
+    L.push('okno: ' + innerWidth + '×' + innerHeight + ', dpr ' + devicePixelRatio + ', ' + document.visibilityState +
+      ', fokus ' + document.hasFocus() + ', aktywny ' + opisEl(document.activeElement) +
+      ', ciemny motyw ' + matchMedia('(prefers-color-scheme: dark)').matches);
+    for (const f of document.querySelectorAll('iframe[id="wydruka"]')) {
+      L.push('iframe#wydruka' + (f === ramka ? ' (TA)' : '') + ': ' + srcTxt(f.src) + ', ' + rectTxt(f) +
+        (isOverlayElementVisible(f) ? '' : ', niewidoczna') + ', w ' + opisEl(f.closest('.przegladarka, .popup-window')));
+    }
+    if (ramka) {
+      const cs = getComputedStyle(ramka);
+      const atr = [];
+      for (const a of ramka.attributes) atr.push(a.name + '=' + srcTxt(a.value).slice(0, 60));
+      L.push('ramka: display ' + cs.display + ', visibility ' + cs.visibility + ', opacity ' + cs.opacity +
+        ', tło ' + cs.backgroundColor + ', color-scheme ' + cs.colorScheme + '; atrybuty: ' + atr.join(' '));
+      const r = ramka.getBoundingClientRect();
+      const stos = [];
+      for (const el of document.elementsFromPoint(r.left + r.width / 2, r.top + r.height / 2)) {
+        if (stos.length >= 6) break;
+        const s = getComputedStyle(el);
+        stos.push(opisEl(el) + ' [z ' + s.zIndex + ', op ' + s.opacity + ', tło ' + s.backgroundColor + ']');
+      }
+      L.push('na środku ramki (od wierzchu): ' + (stos.join(' > ') || 'nic (poza oknem?)'));
+      const przodkowie = [];
+      for (let el = ramka.parentElement; el && el !== document.documentElement; el = el.parentElement) {
+        const s = getComputedStyle(el);
+        const inne = [];
+        if (s.display === 'none') inne.push('display none');
+        if (s.visibility !== 'visible') inne.push('visibility ' + s.visibility);
+        if (s.opacity !== '1') inne.push('opacity ' + s.opacity);
+        if (s.transform !== 'none') inne.push('transform');
+        if (s.filter !== 'none') inne.push('filter ' + s.filter);
+        if (s.zIndex !== 'auto') inne.push('z ' + s.zIndex);
+        if (s.position !== 'static') inne.push(s.position);
+        if (s.overflow !== 'visible') inne.push('overflow ' + s.overflow);
+        if (s.backgroundColor !== 'rgba(0, 0, 0, 0)') inne.push('tło ' + s.backgroundColor);
+        przodkowie.push(opisEl(el) + (inne.length ? ' {' + inne.join(', ') + '}' : ''));
+      }
+      L.push('przodkowie ramki: ' + przodkowie.join(' < '));
+    }
+    for (const p of document.querySelectorAll('[id^="_uf_przeslona"]')) {
+      L.push('przesłona ' + opisEl(p) + ': ' + (isOverlayElementVisible(p) ? 'WIDOCZNA ' + rectTxt(p) + ', z ' + getComputedStyle(p).zIndex : 'ukryta'));
+    }
+    const tekst = L.join('\n');
+    const zapisz = (dopisek) => {
+      const t = tekst + '\nPDF w pamięci podręcznej: ' + dopisek;
+      dbg('podglądWydruku ZRZUT:\n' + t);
+      podgladDiagZapisz('zrzuty', t);
+    };
+    // Kopia PDF-a z pamięci podręcznej — bez zapytania do serwera. W teście
+    // headless odpowiedź przychodziła po 8 ms–3,5 s, stąd limit 10 s.
+    const src = ramka?.src || '';
+    if (!/^(https?|blob):/.test(src)) { zapisz('nie dotyczy (' + srcTxt(src) + ')'); return; }
+    let gotowe = false;
+    const limit = setTimeout(() => { if (!gotowe) { gotowe = true; zapisz('bez odpowiedzi w 10 s'); } }, 10000);
+    fetch(src, src.startsWith('blob:') ? {} : { cache: 'only-if-cached', mode: 'same-origin' })
+      .then((r) => r.arrayBuffer().then((b) => {
+        const u = new Uint8Array(b);
+        const pocz = String.fromCharCode.apply(null, u.subarray(0, 8));
+        const kon = String.fromCharCode.apply(null, u.subarray(Math.max(0, u.length - 1024)));
+        return 'HTTP ' + r.status + ', ' + (r.headers.get('content-type') || '?') + ', ' + u.length + ' B, początek ' +
+          JSON.stringify(pocz) + ', %%EOF ' + (kon.includes('%%EOF') ? 'jest' : 'BRAK');
+      }))
+      .catch((e) => 'brak (' + (e?.message || e) + ')')
+      .then((s) => { if (!gotowe) { gotowe = true; clearTimeout(limit); zapisz(s); } });
+  }
+
+  GM_registerMenuCommand?.('Podgląd wydruku czarny — zapisz stan (Serum)', () => {
+    podgladZrzut();
+    showToast('Zapisano stan podglądu wydruku (diagnostyka)');
+  });
+
   let podgladWydrukuWatchTimer = null;
   let podgladWydrukuWatchLastBeat = 0;
   let podgladWydrukuFocusLost = false;
@@ -5259,29 +5444,34 @@
     // 1) ściąga fokus z ramki PDF, żeby Esc zawsze docierał do strony,
     // 2) wykrywa zamknięcie modalnego okna drukowania po „dziurze” czasowej
     //    (okno drukowania zamraża JS strony) i wtedy zamyka podgląd samo.
-    const open = Boolean(findPodgladWydrukuHeading());
-    if (!open) {
+    const heading = findPodgladWydrukuHeading();
+    if (!heading) {
       if (podgladWydrukuWatchTimer) {
         clearInterval(podgladWydrukuWatchTimer);
         podgladWydrukuWatchTimer = null;
       }
+      podgladDiagKoniec();
       return;
     }
     if (podgladWydrukuWatchTimer) return;
 
+    podgladDiagStart(heading);
     podgladWydrukuWatchLastBeat = Date.now();
     podgladWydrukuFocusLost = false;
     podgladWydrukuWatchTimer = setInterval(() => {
       if (!findPodgladWydrukuHeading()) {
         clearInterval(podgladWydrukuWatchTimer);
         podgladWydrukuWatchTimer = null;
+        podgladDiagKoniec();
         return;
       }
       const now = Date.now();
       const gap = now - podgladWydrukuWatchLastBeat;
       podgladWydrukuWatchLastBeat = now;
+      if (podgladDiag && !document.hidden && gap - 250 > podgladDiag.maxPrzerwa) podgladDiag.maxPrzerwa = gap - 250;
       if (gap > 2000 && !document.hidden) {
         dbg('modPodgladWydrukuFokus: JS był zamrożony ' + gap + 'ms (okno drukowania) — zamykam podgląd');
+        podgladZamkniecie('JS zamrożony ' + gap + ' ms');
         closePodgladWydruku();
         return;
       }
@@ -5297,12 +5487,16 @@
       } else if (podgladWydrukuFocusLost) {
         podgladWydrukuFocusLost = false;
         dbg('modPodgladWydrukuFokus: strona odzyskała fokus po dialogu drukowania — zamykam podgląd');
+        podgladZamkniecie('fokus po dialogu drukowania');
         closePodgladWydruku();
         return;
       }
 
       const ae = document.activeElement;
-      if (ae && ae.tagName === 'IFRAME') ae.blur();
+      if (ae && ae.tagName === 'IFRAME') {
+        ae.blur();
+        if (podgladDiag) podgladDiag.blur++;
+      }
     }, 250);
   }
 
@@ -5313,6 +5507,7 @@
     // żeby druk zdążył się wysłać).
     window.addEventListener('afterprint', () => {
       if (!findPodgladWydrukuHeading()) return;
+      podgladZamkniecie('afterprint');
       setTimeout(() => closePodgladWydruku(), 300);
     });
 
@@ -5333,6 +5528,7 @@
         e.preventDefault();
         e.stopImmediatePropagation();
         dbg('bootPodgladWydruku: Esc → zamykam PODGLĄD WYDRUKU');
+        podgladZamkniecie('Esc');
         closePodgladWydruku();
       },
       true
