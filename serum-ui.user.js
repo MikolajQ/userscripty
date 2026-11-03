@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.128.0
+// @version      3.129.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404 (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.126.0';
+  const SCRIPT_VERSION = '3.129.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -509,6 +509,7 @@
       'Ostatni uiTick(): ' + tickAgo + ' — łącznie ' + uiTickCount + ' ticków (średnio co ' + perTick + 's)\n' +
       'Wpisów w logu: ' + DEBUG_LOG.length + '\n' +
       'Mutacji odfiltrowanych jako szum: ' + szumOdfiltrowany + '\n' +
+      'Nagłówki Serum: ' + naglowkiPodsumowanie() + '\n' +
       'Co wyzwalało ticki (najczęstsze):\n' + formatTickTriggers() + '\n' +
       'Czas modułów (od wstrzyknięcia skryptu):\n' + formatModuleProfile() + '\n' +
       'Czas kroków w środku modułów:\n' + formatKrokProfile() + '\n\n' +
@@ -3157,6 +3158,145 @@
   }
 
   wstrzyknijDoStrony(historiaWTleStronie);
+
+  // =====================================================================
+  // MODUŁ: przyklejone nagłówki tabel Serum (jquery.fixedtableheader)
+  // Dane serum-diag 1.2 (28.10–02.11, próbki co 5 min): wtyczka przy każdym
+  // wywołaniu dokłada do <body> kopię nagłówka oraz po jednym handlerze
+  // window.scroll i window.resize, a niczego nie usuwa. Serum woła ją na każdej
+  // nowo narysowanej tabeli .przyklej/.przyklej_dwa (potem klasa .przyklejone),
+  // stare tabele wypadają z dokumentu, a ich kopie i handlery zostają: 29.10
+  // było ich 1010. Koszt przewijania rośnie liniowo, o 0,035 ms na handler na
+  // zdarzenie (regresja z 217 próbek, odchylenie 1 ms). Przy 1000 kopiach
+  // jedno zdarzenie scroll trwało 31–38 ms, czyli prawie każde dłużej niż
+  // klatka. Handlery trzymają też w pamięci całe stare tabele, a 1000 kopii
+  // w body to dodatkowe ~17 tys. elementów (także w przelocie tabeleStrony).
+  // Kod wtyczki ze strony (serum_diag_kod_v1, jQuery 1.12.1): dla tabeli poza
+  // dokumentem offset() i height() dają 0, więc jej handler scroll tylko chowa
+  // kopię. Usunięcie kopii razem z handlerami niczego na ekranie nie zmienia.
+  // Opakowanie zapamiętuje, co dołożyło dane wywołanie (nowe kopie w body,
+  // nowe handlery okna). Przed kolejnym wywołaniem usuwa wpisy, których tabele
+  // są już poza dokumentem albo właśnie są przyklejane drugi raz. Bez timerów
+  // i obserwatorów: sprzątanie idzie wtedy, gdy Serum i tak rysuje tabelę.
+  function naglowkiStronie() {
+    if (window.__serumUiNaglowki) return;
+    var J = null;
+    var wpisy = [];
+    var st = { wywolan: 0, kopii: 0, usunieto: 0, duble: 0, podmian: 0, ms: 0, maxMs: 0, podpiete: '', blad: '' };
+    var RE_KOPIA = /^fixedtableheader\d+$/;
+    function handlery(typ) {
+      var ev = J._data(window, 'events');
+      return ev && ev[typ] ? ev[typ] : null;
+    }
+    function dolozone(lista, od) {
+      var out = [];
+      for (var i = od; lista && i < lista.length; i++) out.push(lista[i].handler);
+      return out;
+    }
+    function sprzataj(tabele) {
+      var zostaw = [];
+      for (var i = 0; i < wpisy.length; i++) {
+        var w = wpisy[i], zywa = false, dubel = false, k;
+        for (k = 0; k < w.tabele.length; k++) {
+          if (tabele.indexOf(w.tabele[k]) >= 0) dubel = true;
+          else if (w.tabele[k].isConnected) { zywa = true; break; }
+        }
+        if (zywa) { zostaw.push(w); continue; }
+        for (k = 0; k < w.scroll.length; k++) J(window).off('scroll', w.scroll[k]);
+        for (k = 0; k < w.resize.length; k++) J(window).off('resize', w.resize[k]);
+        J(w.kopie).remove();
+        st.usunieto += w.kopie.length;
+        if (dubel) st.duble += w.kopie.length;
+      }
+      wpisy = zostaw;
+    }
+    function opakuj(oryg) {
+      var f = function () {
+        var t0 = performance.now();
+        var tabele = [];
+        for (var i = 0; i < this.length; i++) tabele.push(this[i]);
+        try { sprzataj(tabele); } catch (e) { st.blad = String(e && e.message || e); }
+        var s = handlery('scroll'), r = handlery('resize');
+        var ns = s ? s.length : 0, nr = r ? r.length : 0;
+        var body = document.body;
+        var ostatni = body ? body.lastChild : null;
+        var t1 = performance.now();
+        var wynik = oryg.apply(this, arguments);
+        var t2 = performance.now();
+        try {
+          var wpis = { tabele: tabele, kopie: [], scroll: dolozone(handlery('scroll'), ns), resize: dolozone(handlery('resize'), nr) };
+          for (var n = ostatni ? ostatni.nextSibling : body && body.firstChild; n; n = n.nextSibling) {
+            if (n.nodeType === 1 && n.tagName === 'TABLE' && RE_KOPIA.test(n.id)) wpis.kopie.push(n);
+          }
+          if (wpis.kopie.length || wpis.scroll.length || wpis.resize.length) {
+            wpisy.push(wpis);
+            st.kopii += wpis.kopie.length;
+          }
+        } catch (e) { st.blad = String(e && e.message || e); }
+        var ms = (t1 - t0) + (performance.now() - t2);
+        st.wywolan++;
+        st.ms += ms;
+        if (ms > st.maxMs) st.maxMs = ms;
+        return wynik;
+      };
+      f.__serumUi = true;
+      return f;
+    }
+    // Akcesor zamiast zwykłego pola: gdyby Serum wczytało skrypt wtyczki
+    // drugi raz, przypisanie jQuery.fn.fixedtableheader = … też zostanie
+    // opakowane.
+    function podepnij() {
+      var j = window.jQ;
+      if (J || !j || !j.fn || typeof j.fn.fixedtableheader !== 'function' || typeof j._data !== 'function') return;
+      J = j;
+      var biezaca = opakuj(j.fn.fixedtableheader);
+      try {
+        Object.defineProperty(j.fn, 'fixedtableheader', {
+          configurable: true,
+          enumerable: true,
+          get: function () { return biezaca; },
+          set: function (v) {
+            st.podmian++;
+            biezaca = typeof v === 'function' && !v.__serumUi ? opakuj(v) : v;
+          },
+        });
+      } catch (e) {
+        j.fn.fixedtableheader = biezaca;
+      }
+      st.podpiete = new Date().toLocaleTimeString('pl-PL');
+    }
+    podepnij();
+    if (!J) {
+      document.addEventListener('DOMContentLoaded', podepnij);
+      window.addEventListener('load', podepnij);
+    }
+    // Podsumowanie do logu debug (buildLogText) — tylko na żądanie.
+    window.__serumUiNaglowki = function () {
+      podepnij();
+      if (!J) return 'wtyczki nie ma na tej stronie (jQ.fn.fixedtableheader)';
+      var kopiiPod = 0;
+      for (var i = 0; i < wpisy.length; i++) kopiiPod += wpisy[i].kopie.length;
+      var wBody = 0;
+      for (var n = document.body ? document.body.firstChild : null; n; n = n.nextSibling) {
+        if (n.nodeType === 1 && n.tagName === 'TABLE' && RE_KOPIA.test(n.id)) wBody++;
+      }
+      var s = handlery('scroll');
+      return 'podpięte ' + st.podpiete + ', wywołań ' + st.wywolan + ', kopii dołożonych ' + st.kopii +
+        ', usuniętych ' + st.usunieto + ' (w tym przyklejonych drugi raz: ' + st.duble + '); teraz kopii w body ' + wBody +
+        ' (pod kontrolą ' + kopiiPod + '), handlerów scroll okna ' + (s ? s.length : 0) +
+        '; czas opakowania ' + st.ms.toFixed(1) + ' ms (max ' + st.maxMs.toFixed(1) + ' ms)' +
+        (st.podmian ? '; wtyczka wczytana ponownie ' + st.podmian + '×' : '') +
+        (st.blad ? '; BŁĄD: ' + st.blad : '');
+    };
+  }
+
+  wstrzyknijDoStrony(naglowkiStronie);
+
+  function naglowkiPodsumowanie() {
+    const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    try { return String(uw.__serumUiNaglowki?.() ?? 'brak kodu strony'); }
+    catch (e) { return 'wyjątek: ' + (e?.message || e); }
+  }
 
   // Limit na wypadek zawieszonego zapytania (zdarzenie ze strony nie przyszło).
   const HISTORIA_TLO_LIMIT_MS = 180_000;
