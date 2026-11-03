@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — diagnostyka DOM (tymczasowa)
 // @namespace    local.serum-diag
-// @version      1.2.0
+// @version      1.3.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-diag.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-diag.user.js
-// @description  Sam robi zrzuty struktury strony Serum (id, klasy, tabele, ramki, liczniki) w kolejnych stanach pracy, co 5 min próbkuje kopie przyklejonego nagłówka, handlery okna i koszt przewijania, odkłada log debug serum-ui — wszystko w localStorage — dane do dalszej optymalizacji serum-ui. Niczego nie zmienia na stronie, wyłącza się sam po 7 dniach.
+// @description  Sam robi zrzuty struktury strony Serum (id, klasy, tabele, ramki, liczniki) w kolejnych stanach pracy, co 5 min próbkuje kopie przyklejonego nagłówka, handlery okna i koszt przewijania, odkłada log debug serum-ui (najdłuższe uruchomienia) — wszystko w localStorage — dane do dalszej optymalizacji serum-ui. Niczego nie zmienia na stronie, wyłącza się sam po 14 dniach.
 // @match        https://s2.serum.com.pl/*
 // @noframes
 // @grant        none
@@ -17,13 +17,15 @@
   'use strict';
 
   const KLUCZ = 'serum_diag_v1';
-  const DNI_DZIALANIA = 7;
+  // 1.3: 14 dni (do 10.11) — pomiar po serum-ui 3.129 (sprzątanie nagłówków)
+  // tym samym przyrządem co przed nią.
+  const DNI_DZIALANIA = 14;
   const CO_ILE_MS = 3000;            // sprawdzenie stanu strony
   const PONOW_PO_MS = 45 * 60000;    // ten sam stan — kolejny zrzut najwcześniej po tylu ms
   const LIMIT_ZNAKOW = 1500000;      // cały zapis w localStorage (limit Firefoksa: 5 MB na witrynę)
   const KLUCZ_LOG = 'serum_diag_log_v1';
   const LOG_CO_ILE_MS = 15 * 60000;  // kopia logu debug serum-ui
-  const LOG_URUCHOMIEN = 12;         // tyle ostatnich wstrzyknięć serum-ui trzymamy (~80 KB każde)
+  const LOG_URUCHOMIEN = 12;         // tyle wstrzyknięć serum-ui trzymamy (~80 KB każde)
 
   function czytaj() {
     try { return JSON.parse(localStorage.getItem(KLUCZ) || 'null'); } catch (e) { return null; }
@@ -272,8 +274,17 @@
     // Klucz: dzień + chwila wstrzyknięcia — jedno uruchomienie serum-ui = jeden wpis, nadpisywany.
     const klucz = new Date().toLocaleDateString('pl-PL') + ' ' + boot;
     log[klucz] = { at: Date.now(), txt: maskujLog(txt) };
-    const klucze = Object.keys(log).sort((a, b) => log[a].at - log[b].at);
-    while (klucze.length > LOG_URUCHOMIEN) delete log[klucze.shift()];
+    // 1.3: przy nadmiarze wypada uruchomienie z NAJMNIEJSZĄ liczbą ticków
+    // (przy remisie starsze), a nie najstarsze. 1.2 trzymało 12 ostatnich i
+    // 02.11 cztery przeładowania w 4 s (strona 404, logowanie) wypchnęły logi
+    // całodniowych sesji.
+    const ticki = (k) => {
+      const m = /łącznie (\d+) ticków/.exec(log[k].txt || '');
+      return m ? Number(m[1]) : 0;
+    };
+    const klucze = Object.keys(log).filter((k) => k !== klucz)
+      .sort((a, b) => (ticki(a) - ticki(b)) || (log[a].at - log[b].at));
+    while (klucze.length >= LOG_URUCHOMIEN) delete log[klucze.shift()];
     try { localStorage.setItem(KLUCZ_LOG, JSON.stringify(log)); } catch (e) {}
   }
 
