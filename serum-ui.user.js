@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.131.0
+// @version      3.132.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, po podpisie DANE WIZYTY), przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.131.0';
+  const SCRIPT_VERSION = '3.132.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -3632,6 +3632,7 @@
     const [nr, tekst] = String(e.detail || '').split('\t');
     const tej = Number(nr) === historiaTloNr && historiaTloOd > 0;
     dbg('modHistoriaWizytFiltr: tło — ' + tekst + (tej ? '' : ' (inna lista — bez zmian)'));
+    podgladTlo('historia w tle: ' + tekst.split(',')[0]);
     if (!tej) return;
     historiaTloOd = 0;
     if (!/^wstawiono/.test(tekst)) {
@@ -3713,6 +3714,7 @@
           dbg('modHistoriaWizytFiltr: wczytywanie w tle bez strażnika odpowiedzi — wyłączone do przeładowania strony');
         } else {
           dbg('modHistoriaWizytFiltr: ' + (m ? 'wczytuję listę HISTORIA WIZYT w tle (bez przesłony)' : 'wczytywanie w tle — ' + wynik));
+          if (m) podgladTlo('historia w tle: start');
         }
         return;
       }
@@ -5580,6 +5582,20 @@
     if (e.contentType) s += ', typ RT ' + e.contentType;
     return s;
   }
+  // Czy nawigacja ramki się zatwierdziła (test headless 05.11, ciemny motyw,
+  // ~/serum-audyt/test-czarny). Dopóki nie przyjdą pierwsze bajty PDF-a
+  // (brak odpowiedzi albo same nagłówki), w ramce siedzi początkowy
+  // about:blank tego samego pochodzenia — dostępny dla strony, na ekranie
+  // BIAŁY. Po pierwszych bajtach wchodzi przeglądarka PDF i contentDocument
+  // jest null. Jeśli PDF urwie się w trakcie, ramka jest CZARNA (ciemne tło,
+  // „0 z 0”, pasek postępu) i bez load — to jest zgłaszany czarny podgląd.
+  function stanRamki(ramka) {
+    try {
+      const doc = ramka?.contentDocument;
+      if (!doc) return 'przeglądarka PDF (dokument niedostępny)';
+      return 'dokument ' + srcTxt(doc.URL) + ' ' + doc.readyState;
+    } catch (e) { return 'wyjątek ' + (e?.name || e); }
+  }
   function podgladRamka(heading) {
     const kont = heading?.closest?.('.przegladarka, .popup-window') || heading;
     return kont?.querySelector?.('iframe') || null;
@@ -5600,8 +5616,42 @@
   }
   function podgladDiagOpis(d) {
     return 'ramka na starcie ' + d.rectStart + '; load: ' + (d.loady.join(' | ') || 'brak w trakcie podglądu') +
+      (d.ponowiono ? '; PONOWIONO ' + d.ponowiono : '') +
       '; PDF: ' + (d.rt.join(' | ') || 'brak wpisu Resource Timing') +
+      '; inne zapytania zakończone w trakcie: ' + d.inne + ' (' + Math.round(d.inneB / 1024) + ' kB)' +
+      (d.tlo.length ? ', ' + d.tlo.join(', ') : '') +
       '; fokus zabrany ' + d.blur + '×, max przerwa wątku ' + d.maxPrzerwa + ' ms';
+  }
+  // Zapytania serum-ui w tle (historia wizyt) z czasem względem otwarcia.
+  function podgladTlo(co) {
+    try {
+      if (podgladDiag && podgladDiag.tlo.length < 4) {
+        podgladDiag.tlo.push(co + ' +' + ((performance.now() - podgladDiag.t0) / 1000).toFixed(1) + ' s');
+      }
+    } catch (_) {}
+  }
+
+  // Strażnik wczytania (3.132). 05.11 13:09 czarny podgląd „Skierowanie do
+  // laboratorium”: przez 20 s ramka nie dostała load ani wpisu Resource Timing,
+  // choć inne zapytania do Serum w tym czasie przechodziły (historia wizyt
+  // w tle, 926 kB). Czarny kolor = PDF urwany w trakcie (zob. stanRamki). W 59 udanych podglądach z 04–05.11 load przychodził po
+  // 31–1846 ms, a ponowne otwarcie zadziałało od razu. Dlatego po 6 s bez load
+  // ramka jeden raz wczytuje ten sam adres. Tylko przy fokusie strony, bo bez
+  // niego może być otwarte okno drukowania albo menu. Woła go interwał
+  // podglądu, który już działa — bez nowych timerów.
+  const PODGLAD_PONOW_MS = 6000;
+  function podgladStraznikWczytania() {
+    const d = podgladDiag;
+    if (!d || d.ponowiono || d.loady.length || !d.ramka?.isConnected) return;
+    const ms = performance.now() - d.t0;
+    if (ms < PODGLAD_PONOW_MS || document.hidden || !document.hasFocus()) return;
+    const src = d.ramka.src;
+    if (!/^https?:.*\/pdf\//.test(src)) return;
+    d.ponowiono = 'po ' + (ms / 1000).toFixed(1) + ' s (stan ramki: ' + stanRamki(d.ramka) +
+      ', inne zapytania do tej chwili: ' + d.inne + ')';
+    dbg('podglądWydruku: brak load — ' + d.ponowiono + ' — wczytuję ramkę ponownie');
+    showToast('PDF nie przyszedł w ' + Math.round(ms / 1000) + ' s — wczytuję podgląd ponownie', { durationMs: 4000 });
+    d.ramka.src = src;
   }
 
   function podgladDiagStart(heading) {
@@ -5609,6 +5659,7 @@
     const d = {
       t0: performance.now(), okno: opisEl(heading), ramka: ramka, src: ramka ? srcTxt(ramka.src) : 'brak ramki',
       rectStart: rectTxt(ramka), loady: [], rt: [], blur: 0, maxPrzerwa: 0, zamkniecie: '', po: null, onLoad: null,
+      ponowiono: '', inne: 0, inneB: 0, tlo: [],
     };
     podgladDiag = d;
     if (!ramka) return;
@@ -5628,7 +5679,13 @@
       if (e) d.rt.push('sprzed ' + ((d.t0 - e.responseEnd) / 1000).toFixed(1) + ' s: ' + rtTxt(e));
       d.po = new PerformanceObserver((lista) => {
         for (const w of lista.getEntries()) {
-          if (d.rt.length < 6 && (w.name === ramka.src || w.initiatorType === 'iframe' || /\/pdf\//.test(w.name))) d.rt.push(rtTxt(w));
+          if (w.name === ramka.src || w.initiatorType === 'iframe' || /\/pdf\//.test(w.name)) {
+            if (d.rt.length < 6) d.rt.push(rtTxt(w));
+          } else {
+            // Czy sieć i serwer żyją, gdy PDF nie przychodzi.
+            d.inne++;
+            d.inneB += w.encodedBodySize || 0;
+          }
         }
       });
       d.po.observe({ type: 'resource' });
@@ -5661,6 +5718,8 @@
         (isOverlayElementVisible(f) ? '' : ', niewidoczna') + ', w ' + opisEl(f.closest('.przegladarka, .popup-window')));
     }
     if (ramka) {
+      L.push('stan ramki: ' + stanRamki(ramka) + (d && d.ramka !== ramka
+        ? '; ramka z otwarcia: ' + (d.ramka?.isConnected ? 'INNA, nadal w dokumencie' : 'USUNIĘTA (Serum podmieniło ramkę)') : ''));
       const cs = getComputedStyle(ramka);
       const atr = [];
       for (const a of ramka.attributes) atr.push(a.name + '=' + srcTxt(a.value).slice(0, 60));
@@ -5760,6 +5819,7 @@
       const gap = now - podgladWydrukuWatchLastBeat;
       podgladWydrukuWatchLastBeat = now;
       if (podgladDiag && !document.hidden && gap - 250 > podgladDiag.maxPrzerwa) podgladDiag.maxPrzerwa = gap - 250;
+      podgladStraznikWczytania();
       if (gap > 2000 && !document.hidden) {
         dbg('modPodgladWydrukuFokus: JS był zamrożony ' + gap + 'ms (okno drukowania) — zamykam podgląd');
         podgladZamkniecie('JS zamrożony ' + gap + ' ms');
