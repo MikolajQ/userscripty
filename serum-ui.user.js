@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.130.0
+// @version      3.131.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, po podpisie DANE WIZYTY), przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.130.0';
+  const SCRIPT_VERSION = '3.131.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -83,10 +83,44 @@
       }
       if (s.indexOf('dokument został podpisany') !== -1) return true;
       // „Wysłano do P1” po podpisaniu IPOM-u.
-      if (s.trim().indexOf('wysłano do p1') === 0) return true;
+      if (s.trim().indexOf('wysłano do p1') === 0) {
+        ipomPodpisanyZKarty();
+        return true;
+      }
       if (s.indexOf('dokumenty zostały wysłane do zus') !== -1) return true;
       if (s.indexOf('zapisać świadczenie') !== -1 && s.indexOf('odznaczony') !== -1 && s.indexOf('kontynuować') !== -1) return true;
       return false;
+    }
+
+    // Podpis IPOM-u z karty („Zapisz i podpisz”) — ipomjs.js, saveElectronicIPOM:
+    //   alert(result.message);
+    //   if (result.status == "OK") { uf_schowaj_div(); …trigger("close");
+    //     wize_f_zmien_typ_wizyty('ipom', '1473'); … }
+    // Odpowiedź OK to {"status":"OK","message":"Wysłano do P1"} (ipom-diag
+    // 05.11.2026). To jedno wywołanie, w tym samym zadaniu co alert, kierujemy
+    // na DANE WIZYTY — tak jak klik w zakładkę (wize_f_zmien_typ_wizyty('biezaca')).
+    // Anulowanie IPOM-u z listy też kończy się „Wysłano do P1”, ale bez
+    // otwartej karty — wtedy nic nie zmieniamy.
+    function ipomPodpisanyZKarty() {
+      var okno = document.getElementById('electronicIPOMPopup');
+      if (!document.getElementById('formIPOM') || !okno || !okno.classList.contains('show')) return;
+      var oryg = window.wize_f_zmien_typ_wizyty;
+      if (typeof oryg !== 'function') return;
+      var zglos = function (co) {
+        try { document.dispatchEvent(new CustomEvent('serum-ipom-podpisany', { detail: co })); } catch (e) {}
+      };
+      var zamiast = function (typ) {
+        if (window.wize_f_zmien_typ_wizyty === zamiast) window.wize_f_zmien_typ_wizyty = oryg;
+        if (typ !== 'ipom') return oryg.apply(this, arguments);
+        zglos('DANE WIZYTY zamiast listy IPOM');
+        return oryg.call(window, 'biezaca');
+      };
+      window.wize_f_zmien_typ_wizyty = zamiast;
+      setTimeout(function () {
+        if (window.wize_f_zmien_typ_wizyty !== zamiast) return;
+        window.wize_f_zmien_typ_wizyty = oryg;
+        zglos('Serum nie przełączyło zakładki — bez zmian');
+      }, 0);
     }
 
     // Lista ostrzeżeń recepty to linie „ - …” (prescriptions.js,
@@ -314,6 +348,7 @@
     'serum-ui-lab-copy-btn',
     'serum-ui-clipboard-helper',
     'serum-ui-login-blokada',
+    'serum-ui-ipom-etykieta',
   ]);
 
   // Mutacje, które NIGDY nie interesują żadnego modułu — czysty szum.
@@ -829,6 +864,258 @@
     ipomSigned = true;
     dbg('modPodpiszIpom: klik Podpisz');
     signBtn.click();
+  }
+
+  // --- IPOM: etykieta w nagłówku wizyty ---
+  // Dane z zrzutu ipom-diag (05.11.2026) i kodu Serum:
+  //  - wiersz „Tel.” nagłówka: <td id="wiz_td_telefon"><span id="wiz_e_pacjent_telefon_span">…</span></td>;
+  //  - lista IPOM-ów pacjenta (wszystkich lekarzy, wszystkich lat) to
+  //    ap_ipom.html_lista: #div_lista_dane > table.wiersz z kolumną „Data utworzenia”
+  //    w formacie „dd-mm-rrrr gg:mm”;
+  //  - Serum wczytuje ją dopiero po kliknięciu zakładki IPOM, więc przy
+  //    otwarciu wizyty pobieramy ją sami w tle (ipomStronie, ~5 KB, ~170 ms).
+  // O roku decyduje „Data utworzenia” (decyzja użytkownika 05.11.2026).
+  // Zielona: IPOM-y są, ale żaden z bieżącego roku. Czerwona: jest z bieżącego.
+  // Brak IPOM-ów — brak etykiety.
+
+  // Kod strony: zapytanie Serum (uf_promise, bez przesłony) tak jak w
+  // f_ipom_html("WIZ_EDM"). Stała [[302]] jest wpisana przez Serum w kod
+  // strony — bierzemy ją z f_wiz_ipom_js, która jest na stronie od początku
+  // (to ona dopiero ładuje ap_ipom.js z f_ipom_html).
+  function ipomStronie() {
+    if (window.__serumUiIpomLista) return;
+    var param302 = null;
+    window.__serumUiIpomLista = function (idpacjenta, nr) {
+      if (typeof window.uf_promise !== 'function') return 'brak uf_promise';
+      if (param302 === null) {
+        var f = window.f_wiz_ipom_js;
+        var m = typeof f === 'function' ? /\[\[302\]\](\d+)/.exec(Function.prototype.toString.call(f)) : null;
+        if (!m) return 'brak [[302]] w f_wiz_ipom_js';
+        param302 = m[1];
+      }
+      var t0 = performance.now();
+      var zglos = function (ok, tekst) {
+        try {
+          document.dispatchEvent(new CustomEvent('serum-ipom-lista', {
+            detail: nr + '\t' + Math.round(performance.now() - t0) + '\t' + ok + '\t' + tekst,
+          }));
+        } catch (e) {}
+      };
+      window.uf_promise('ap_ipom.html_lista', 'p=DEF2]]2[[26]]' + idpacjenta + '[[302]]' + param302 + '[[466]]WIZ_EDM[[2000]]')
+        .then(function (rTxt) { zglos(1, String(rTxt)); }, function (e) { zglos(0, String(e)); });
+      return 'OK';
+    };
+  }
+
+  wstrzyknijDoStrony(ipomStronie);
+
+  const IPOM_ETYKIETA_ID = 'serum-ui-ipom-etykieta';
+  let ipomKlucz = '';          // idpacjenta|idkontaktu wizyty, której dotyczy ipomWynik
+  let ipomWynik = null;        // { ile, wRoku, rok, ostatni } albo null = nie wiadomo
+  let ipomZapytanie = 0;       // numer ostatniego zapytania w tle; starsze odpowiedzi odpadają
+  let ipomPobierz = false;     // pobrać listę przy najbliższym ticku
+  let ipomTabelaSekcji = null; // ostatnio przeczytana lista z zakładki IPOM
+  const ipomZalogowane = new Set();
+
+  function ipomDbgRaz(msg) {
+    if (ipomZalogowane.has(msg)) return;
+    ipomZalogowane.add(msg);
+    dbg(msg);
+  }
+
+  // Kolumna szukana po nagłówku, nie po numerze. Wynik albo napis z powodem,
+  // gdy tabela wygląda inaczej niż w zrzucie — wtedy bez etykiety.
+  function policzIpom(tabela) {
+    const naglowek = tabela?.querySelector('tr.tr_naglowek');
+    if (!naglowek) return 'brak tr.tr_naglowek';
+    let kol = -1;
+    for (let i = 0; i < naglowek.cells.length; i++) {
+      if (normLabel(naglowek.cells[i].textContent) === 'Data utworzenia') { kol = i; break; }
+    }
+    if (kol < 0) return 'brak kolumny „Data utworzenia”';
+    const rok = String(new Date().getFullYear());
+    const wynik = { ile: 0, wRoku: 0, rok, ostatni: '' };
+    let ostatniRmd = '';
+    for (const tr of tabela.rows) {
+      if (tr === naglowek) continue;
+      const m = /^(\d{2})-(\d{2})-(\d{4})\b/.exec(normLabel(tr.cells[kol]?.textContent));
+      if (!m) return 'wiersz bez daty utworzenia (komórek: ' + tr.cells.length + ', „' + normLabel(tr.textContent).slice(0, 40) + '”)';
+      wynik.ile++;
+      if (m[3] === rok) wynik.wRoku++;
+      const rmd = m[3] + m[2] + m[1];
+      if (rmd > ostatniRmd) { ostatniRmd = rmd; wynik.ostatni = m[1] + '-' + m[2] + '-' + m[3]; }
+    }
+    return wynik;
+  }
+
+  function ipomUstaw(w, skad) {
+    ipomWynik = w;
+    dbg('modIpomEtykieta: ' + skad + ' — IPOM: ' + w.ile + ', z ' + w.rok + ': ' + w.wRoku +
+      (w.ile ? ' → etykieta ' + (w.wRoku ? 'czerwona' : 'zielona') : ' → bez etykiety'));
+    rysujEtykieteIpom();
+  }
+
+  function rysujEtykieteIpom() {
+    const td = document.getElementById('wiz_td_telefon');
+    let el = document.getElementById(IPOM_ETYKIETA_ID);
+    const w = ipomWynik;
+    if (!td || !w || !w.ile) {
+      el?.remove();
+      return;
+    }
+    if (!el || el.parentElement !== td) {
+      el?.remove();
+      el = document.createElement('span');
+      el.id = IPOM_ETYKIETA_ID;
+      el.textContent = 'IPOM';
+      el.style.cssText = 'display:inline-block;margin-left:12px;padding:0 7px;border-radius:3px;' +
+        'color:#fff;font:bold 10pt/1.6 sans-serif;letter-spacing:.5px;vertical-align:1px;cursor:default';
+      td.appendChild(el);
+    }
+    const tytul = w.wRoku
+      ? 'IPOM w ' + w.rok + ' już był (ostatni utworzony ' + w.ostatni + ')'
+      : 'W ' + w.rok + ' nie było jeszcze IPOM (ostatni utworzony ' + w.ostatni + ')';
+    if (el.title !== tytul) {
+      el.title = tytul;
+      el.style.background = w.wRoku ? '#c62828' : '#2e7d32';
+    }
+  }
+
+  document.addEventListener('serum-ipom-lista', (e) => {
+    const d = String(e.detail || '');
+    const t1 = d.indexOf('\t');
+    const t2 = d.indexOf('\t', t1 + 1);
+    const t3 = d.indexOf('\t', t2 + 1);
+    // Odpowiedź na starsze zapytanie albo w międzyczasie przeczytana lista z zakładki.
+    if (Number(d.slice(0, t1)) !== ipomZapytanie) return;
+    const ms = d.slice(t1 + 1, t2);
+    const tekst = d.slice(t3 + 1);
+    if (d.slice(t2 + 1, t3) !== '1') {
+      dbg('modIpomEtykieta: lista w tle — błąd po ' + ms + ' ms: ' + tekst.slice(0, 120));
+      return;
+    }
+    const doc = new DOMParser().parseFromString(tekst, 'text/html');
+    const w = policzIpom(doc.querySelector('#div_lista_dane table'));
+    if (typeof w === 'string') {
+      dbg('modIpomEtykieta: lista w tle (' + ms + ' ms, ' + tekst.length + ' zn.) — ' + w + '; bez etykiety');
+      return;
+    }
+    ipomUstaw(w, 'lista w tle (' + ms + ' ms)');
+  });
+
+  function modIpomEtykieta() {
+    const idPac = document.getElementById('wiz_e_pacjent_w')?.value || '';
+    // Bez zakładki IPOM (inna komórka) nie pytamy — Serum też by nie pytało.
+    const klucz = idPac && document.getElementById('wiz_td_telefon') && document.getElementById('wize_zakladka_ipom')
+      ? idPac + '|' + (document.getElementById('hid_idkontaktu')?.value || '')
+      : '';
+    if (klucz !== ipomKlucz) {
+      ipomKlucz = klucz;
+      ipomWynik = null;
+      ipomPobierz = !!klucz;
+    }
+    if (ipomPobierz) {
+      ipomPobierz = false;
+      const nr = ++ipomZapytanie;
+      const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+      let st;
+      try {
+        st = typeof uw.__serumUiIpomLista === 'function' ? uw.__serumUiIpomLista(idPac, nr) : 'brak kodu strony';
+      } catch (e) {
+        st = 'wyjątek: ' + (e?.message || e);
+      }
+      if (st !== 'OK') ipomDbgRaz('modIpomEtykieta: lista w tle niewysłana — ' + st);
+    }
+    // Lista wczytana przez Serum w widocznej zakładce (wejście w nią, zapis
+    // karty) jest świeższa niż nasze zapytanie. Tylko widoczna: ukryta sekcja
+    // mogłaby dostać spóźnioną odpowiedź z poprzedniej wizyty.
+    const sekcja = document.getElementById('wize_sekcja_ipom');
+    if (klucz && sekcja?.firstElementChild && sekcja.style.display !== 'none') {
+      const tabela = sekcja.querySelector('#div_lista_dane table');
+      if (tabela && tabela !== ipomTabelaSekcji) {
+        ipomTabelaSekcji = tabela;
+        const w = policzIpom(tabela);
+        if (typeof w === 'string') {
+          ipomDbgRaz('modIpomEtykieta: lista z zakładki — ' + w);
+        } else {
+          ipomZapytanie++; // odpowiedź w tle, jeśli jeszcze idzie, jest starsza
+          ipomUstaw(w, 'lista z zakładki');
+          return;
+        }
+      }
+    }
+    rysujEtykieteIpom();
+  }
+
+  // Po podpisie z karty Serum nie wczytuje już listy (przekierowanie na
+  // DANE WIZYTY w dialogiStrony), więc etykietę odświeża nasze zapytanie.
+  document.addEventListener('serum-ipom-podpisany', (e) => {
+    dbg('IPOM podpisany z karty: ' + String(e.detail || ''));
+    if (ipomKlucz) ipomPobierz = true;
+    scheduleUiSoon();
+  });
+
+  // --- IPOM: karta — stratyfikacja „stabilny” i wizyta kontrolna ---
+  // Z ipomjs.js i zrzutu karty (05.11.2026):
+  //  - <select id="dataBasicIPOMidSatisfaction">: "" / S=stabilny / P / Z / N, bez
+  //    słuchaczy zmian; szablony Serum ustawiają go samym selectedIndex;
+  //  - „+” (button.x-ipomControlVisit) → createNewRowControlVisit: synchronicznie
+  //    klonuje wiersz wzorcowy jako tr.x-ipomControlVisitRow;
+  //  - plan: select.x-ipomControlVisitTypeOfTerm, 3 = „Po wykonaniu zleconych
+  //    badań”, onchange="showOrhideInputControlVisit(this)" chowa pola liczby/jednostki;
+  //  - tryb karty z f_dodaj_ipom: nowa (idIpom "", newIPOM T), edycja (idIpom, N),
+  //    kopia (idIpom "", N — Serum wypełnia ją potem asynchronicznie z kopiowanego
+  //    IPOM-u, ser.ipom.copyIPOM), podgląd (previewIpom wyłącza selecty).
+  const ipomKartyObsluzone = new WeakSet();
+
+  function ipomOpcjaJest(sel, wartosc, tekst) {
+    for (const o of sel.options) if (o.value === wartosc) return normLabel(o.text) === tekst;
+    return false;
+  }
+
+  function modIpomKarta() {
+    const form = document.getElementById('formIPOM');
+    if (!form || ipomKartyObsluzone.has(form)) return;
+    const strat = document.getElementById('dataBasicIPOMidSatisfaction');
+    const plus = form.querySelector('button.x-ipomControlVisit');
+    if (!strat || !plus) return;
+    ipomKartyObsluzone.add(form);
+
+    const pole = (id) => document.getElementById(id)?.value;
+    const typ = pole('basicInformationTypeIpom');
+    const idIpom = pole('basicInformationIdIpom');
+    let pomin = '';
+    if (typ !== 'I') pomin = 'karta typu „' + typ + '” (nie IPOM)';
+    else if (strat.disabled) pomin = 'podgląd';
+    else if (!idIpom && pole('basicInformationNewIPOM') === 'N') pomin = 'kopia (Serum wypełnia ją z kopiowanego IPOM-u)';
+    if (pomin) {
+      dbg('modIpomKarta: ' + pomin + ' — bez zmian');
+      return;
+    }
+
+    const zrobione = [];
+    if (strat.value === '') {
+      if (ipomOpcjaJest(strat, 'S', 'stabilny')) {
+        strat.value = 'S';
+        zrobione.push('stratyfikacja „stabilny”');
+      } else {
+        zrobione.push('BRAK opcji S = „stabilny”');
+      }
+    }
+    if (!form.querySelector('tr.x-ipomControlVisitRow')) {
+      plus.click();
+      const plan = form.querySelector('tr.x-ipomControlVisitRow select.x-ipomControlVisitTypeOfTerm');
+      if (!plan) {
+        zrobione.push('po „+” brak wiersza wizyty kontrolnej');
+      } else if (!ipomOpcjaJest(plan, '3', 'Po wykonaniu zleconych badań')) {
+        zrobione.push('wizyta kontrolna dodana, BRAK opcji 3 = „Po wykonaniu zleconych badań”');
+      } else {
+        plan.value = '3';
+        plan.dispatchEvent(new Event('change', { bubbles: true }));
+        zrobione.push('wizyta kontrolna „Po wykonaniu zleconych badań”');
+      }
+    }
+    dbg('modIpomKarta: ' + (idIpom ? 'edycja' : 'nowa') + ' — ' + (zrobione.join(', ') || 'nic do uzupełnienia'));
   }
 
   // --- LOGOWANIE DO PUE (auto-PIN przy eZLA) ---
@@ -4829,6 +5116,8 @@
     ['modWyslijSms', modWyslijSms],
     ['modPodpiszERecepte', modPodpiszERecepte],
     ['modPodpiszIpom', modPodpiszIpom],
+    ['modIpomKarta', modIpomKarta],
+    ['modIpomEtykieta', modIpomEtykieta],
     ['modEzlaPue', modEzlaPue],
     ['modEzlaPodpis', modEzlaPodpis],
     ['modEzlaOstrzezenieWyslij', modEzlaOstrzezenieWyslij],
@@ -4944,6 +5233,8 @@
     'modDashboardNav',
     'modHistoriaWizytFiltr',
     'markPatientCells',
+    'modIpomKarta',
+    'modIpomEtykieta',
   ]);
   // modLabKopiujWyniki i syncTopPager NIE są tu wymienione celowo: wstrzykują
   // własne elementy do strony, więc muszą się wykonać, żeby je SCHOWAĆ —
