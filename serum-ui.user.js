@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.133.0
+// @version      3.134.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, po podpisie DANE WIZYTY), przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -980,7 +980,13 @@
       el.id = IPOM_ETYKIETA_ID;
       el.textContent = 'IPOM';
       el.style.cssText = 'display:inline-block;margin-left:12px;padding:0 7px;border-radius:3px;' +
-        'color:#000;font:bold 10pt/1.6 sans-serif;letter-spacing:.5px;vertical-align:1px;cursor:default';
+        'color:#000;font:bold 10pt/1.6 sans-serif;letter-spacing:.5px;vertical-align:1px;cursor:pointer';
+      // Klik = wejście w zakładkę IPOM. Powtórny klik w aktywną zakładkę każe
+      // Serum przeładować sekcję, więc wtedy nic nie robimy.
+      el.addEventListener('click', () => {
+        const z = document.getElementById('wize_zakladka_ipom');
+        if (z && !/topTabsActive/.test(z.className || '')) z.click();
+      });
       td.appendChild(el);
     }
     const tytul = w.zielona
