@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.134.0
+// @version      3.135.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, po podpisie DANE WIZYTY), przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -910,9 +910,13 @@
   wstrzyknijDoStrony(ipomStronie);
 
   const IPOM_ETYKIETA_ID = 'serum-ui-ipom-etykieta';
+  const ipomStyl = document.createElement('style');
+  ipomStyl.textContent = '@keyframes serum-ui-ipom-miganie{0%,100%{opacity:1}50%{opacity:.15}}';
+  document.documentElement.appendChild(ipomStyl);
   let ipomKlucz = '';          // idpacjenta|idkontaktu wizyty, której dotyczy ipomWynik
   let ipomWynik = null;        // { ile, wRoku, rok, ostatni } albo null = nie wiadomo
   let ipomZapytanie = 0;       // numer ostatniego zapytania w tle; starsze odpowiedzi odpadają
+  let ipomTryb = '';           // ostatnio narysowany rodzaj etykiety (do logu)
   let ipomPobierz = false;     // pobrać listę przy najbliższym ticku
   let ipomTabelaSekcji = null; // ostatnio przeczytana lista z zakładki IPOM
   const ipomZalogowane = new Set();
@@ -959,10 +963,75 @@
     return wynik;
   }
 
+  // --- IPOM: sugestia (biała migająca etykieta) ---
+  // Dane z zrzutu rozpoznania-diag (06.11.2026). Obie sekcje to
+  //   table.form > tr > td.sekcja > input#dm_sekcja_pole_rozpoznania | #dm_sekcja_pole_choroby
+  //   table.form > tr > td#dm_sekcja_pole_N > div > table.dane
+  // Wiersz nagłówka tr.tr_naglowek; kolumna „Kod” ma INNY numer w każdej sekcji
+  // (Dotychczasowe rozpoznania: Data|Charakter wizyty|Kod|Opis, Choroby
+  // przewlekłe: Data|Kod|Opis), więc szukamy jej po nagłówku. Komórka kodu to
+  // sam kod, np. „E11”, „Z76.0”.
+  // Biała etykieta: pacjent bez żadnego IPOM-u i choć jeden kod z listy poniżej.
+  // Kody z listy użytkownika; I11.0, I11.9, R73.0 itd. obejmują pozycje bez
+  // kropki (E10 = E10.x), a E89.0 i I20.1/8/9 tylko dokładnie te podkody.
+  const IPOM_ICD = new Set([
+    'E01', 'E02', 'E03', 'E04', 'E05', 'E06', 'E89.0', 'E10', 'E11', 'E13', 'E14',
+    'R73', 'J41', 'J42', 'J43', 'J44', 'J45', 'N18',
+    'I10', 'I11', 'I12', 'I13', 'I15', 'I20.1', 'I20.8', 'I20.9', 'I25', 'I48', 'I50',
+  ]);
+  const IPOM_SEKCJE_ICD = ['dm_sekcja_pole_rozpoznania', 'dm_sekcja_pole_choroby'];
+  // tabela → { n, pierwszy, ostatni, kody } — przeliczamy tylko, gdy Serum
+  // podmieni tabelę albo jej wiersze (węzły, nie tekst: bez czytania komórek).
+  const ipomIcdCache = new WeakMap();
+
+  function ipomKodWskazany(kod) {
+    return IPOM_ICD.has(kod) || IPOM_ICD.has(kod.split('.')[0]) || IPOM_ICD.has(kod.slice(0, 5));
+  }
+
+  function ipomKodyZTabeli(tabela) {
+    const wiersze = tabela.rows;
+    const n = wiersze.length;
+    const pierwszy = wiersze[1] || null;
+    const ostatni = wiersze[n - 1] || null;
+    const c = ipomIcdCache.get(tabela);
+    if (c && c.n === n && c.pierwszy === pierwszy && c.ostatni === ostatni) return c.kody;
+    const kody = [];
+    const naglowek = tabela.querySelector('tr.tr_naglowek');
+    let kol = -1;
+    if (naglowek) {
+      for (let i = 0; i < naglowek.cells.length; i++) {
+        if (normLabel(naglowek.cells[i].textContent) === 'Kod') { kol = i; break; }
+      }
+    }
+    if (kol < 0) {
+      ipomDbgRaz('modIpomEtykieta: sugestia — brak kolumny „Kod” w tabeli rozpoznań');
+    } else {
+      for (let i = 0; i < n; i++) {
+        const tr = wiersze[i];
+        if (tr === naglowek) continue;
+        const kod = (tr.cells[kol]?.textContent || '').trim().toUpperCase();
+        if (kod && ipomKodWskazany(kod) && kody.indexOf(kod) < 0) kody.push(kod);
+      }
+    }
+    ipomIcdCache.set(tabela, { n, pierwszy, ostatni, kody });
+    return kody;
+  }
+
+  // Kody z listy użytkownika znalezione w obu sekcjach (puste = brak sugestii).
+  function ipomKodySugestii() {
+    let wszystkie = [];
+    for (const id of IPOM_SEKCJE_ICD) {
+      const tabela = document.getElementById(id)?.closest('table.form')?.querySelector('table.dane');
+      if (!tabela) continue;
+      for (const k of ipomKodyZTabeli(tabela)) if (wszystkie.indexOf(k) < 0) wszystkie.push(k);
+    }
+    return wszystkie;
+  }
+
   function ipomUstaw(w, skad) {
     ipomWynik = w;
     dbg('modIpomEtykieta: ' + skad + ' — IPOM: ' + w.ile + ', z ' + w.rok + ': ' + w.wRoku +
-      (w.ile ? ' → etykieta ' + (w.zielona ? 'zielona' : 'czerwona') : ' → bez etykiety'));
+      (w.ile ? ' → etykieta ' + (w.zielona ? 'zielona' : 'czerwona') : ' → biała tylko przy kodach ICD z sekcji rozpoznań'));
     rysujEtykieteIpom();
   }
 
@@ -970,8 +1039,11 @@
     const td = document.getElementById('wiz_td_telefon');
     let el = document.getElementById(IPOM_ETYKIETA_ID);
     const w = ipomWynik;
-    if (!td || !w || !w.ile) {
+    // Brak IPOM-ów: etykieta tylko jako sugestia (kody ICD w rozpoznaniach).
+    const kodySug = td && w && !w.ile ? ipomKodySugestii() : null;
+    if (!td || !w || (!w.ile && !kodySug.length)) {
       el?.remove();
+      ipomTryb = '';
       return;
     }
     if (!el || el.parentElement !== td) {
@@ -989,7 +1061,9 @@
       });
       td.appendChild(el);
     }
-    const tytul = w.zielona
+    const tytul = kodySug
+      ? 'Warto rozważyć IPOM: pacjent nie ma jeszcze IPOM, a w rozpoznaniach jest ' + kodySug.join(', ')
+      : w.zielona
       ? 'Można wystawić nowy IPOM: nowy rok i minęło ≥10 mies. (ostatni utworzony ' + w.ostatni + ')'
       : w.wRoku
         ? 'IPOM w ' + w.rok + ' już był (ostatni utworzony ' + w.ostatni + ')'
@@ -998,7 +1072,16 @@
       el.title = tytul;
       // Użytkownik pracuje z inwersją kolorów (pełna, invert(100%)), więc
       // wpisujemy dopełnienia: na ekranie wychodzi czerwony #c62828 / zielony #2e7d32.
-      el.style.background = w.zielona ? '#d182cd' : '#39d7d7';
+      // Biała na ekranie = czarne tło i biały tekst w kodzie (inwersja), miganie
+      // samym CSS (opacity, bez JS w tickach).
+      el.style.background = kodySug ? '#000' : w.zielona ? '#d182cd' : '#39d7d7';
+      el.style.color = kodySug ? '#fff' : '#000';
+      el.style.animation = kodySug ? 'serum-ui-ipom-miganie 2.6s ease-in-out infinite' : '';
+      const tryb = kodySug ? 'biała (' + kodySug.join(', ') + ')' : w.zielona ? 'zielona' : 'czerwona';
+      if (tryb !== ipomTryb) {
+        ipomTryb = tryb;
+        dbg('modIpomEtykieta: etykieta ' + tryb);
+      }
     }
   }
 
