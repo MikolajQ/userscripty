@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Multilab — logowanie, sesja i „Data od”
 // @namespace    local.lab-multilab-auto-login
-// @version      1.1.0
+// @version      1.2.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/lab-multilab-auto-login.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/lab-multilab-auto-login.user.js
 // @description  Multilab (10.1.1.140 i gniew.lab-online.pl): auto logowanie PESEL + PIN zapamiętanymi w menedżerze skryptów, podtrzymanie sesji w tle, „Data od” 60 dni wstecz na stronie Home
@@ -12,6 +12,7 @@
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -20,6 +21,13 @@
 //   keepAlive — każda inna strona (tylko główne okno, nie ramki)
 //   dataOd    — /page,Home  (dawniej osobny skrypt lab-data-od)
 // Wyjątek w jednej części nie zatrzymuje pozostałych.
+//
+// Diagnostyka (od 1.2.0): każdy wpis dbg() trafia też do localStorage strony
+// (klucz multilab_diag_v1, ostatnie 800 wpisów), więc przeżywa przeładowanie
+// i wylogowanie. Dochodzą wpisy o wejściu na stronę (typ nawigacji, skąd),
+// o zapytaniach XHR strony (status, czy odpowiedź to strona logowania),
+// o powrocie do karty i o tym, ile minęło od ostatniego udanego podtrzymania,
+// gdy pojawia się strona logowania. Niczego nie zmienia w działaniu strony.
 
 (function () {
   'use strict';
@@ -32,13 +40,92 @@
   // ───────────── wspólne ─────────────
 
   const DEBUG_LOG = [];
+  const DIAG = {
+    key: 'multilab_diag_v1',
+    max: 800,
+    lastOkPingKey: 'multilab_diag_last_ok_ping',
+    lastLeaveKey: 'multilab_diag_last_leave',
+  };
+  const FRAME_TAG = IS_TOP_WINDOW ? '' : ' (ramka)';
+
+  function diagRead() {
+    try {
+      const arr = JSON.parse(localStorage.getItem(DIAG.key) || '[]');
+      return Array.isArray(arr) ? arr : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function diagPush(line) {
+    try {
+      const arr = diagRead();
+      arr.push(line);
+      if (arr.length > DIAG.max) arr.splice(0, arr.length - DIAG.max);
+      localStorage.setItem(DIAG.key, JSON.stringify(arr));
+    } catch { /* bez localStorage — zostaje log w pamięci i w konsoli */ }
+  }
+
+  function readJson(key) {
+    try {
+      return JSON.parse(localStorage.getItem(key) || 'null');
+    } catch {
+      return null;
+    }
+  }
+
+  function writeJson(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch { /* bez localStorage */ }
+  }
+
+  function agoText(t) {
+    if (!t) return 'nigdy';
+    const s = Math.round((Date.now() - t) / 1000);
+    return s < 120 ? s + ' s temu' : Math.round(s / 60) + ' min temu';
+  }
+
   function dbg(part, msg) {
     const now = new Date();
-    const line = now.toLocaleTimeString('pl-PL', { hour12: false }) + '.' +
-      String(now.getMilliseconds()).padStart(3, '0') + ' [' + part + '] ' + msg;
+    const time = now.toLocaleTimeString('pl-PL', { hour12: false }) + '.' +
+      String(now.getMilliseconds()).padStart(3, '0');
+    const line = time + ' [' + part + '] ' + msg + FRAME_TAG;
     DEBUG_LOG.push(line);
     if (DEBUG_LOG.length > 300) DEBUG_LOG.shift();
     console.info('[multilab] ' + line);
+    const day = String(now.getDate()).padStart(2, '0') + '.' + String(now.getMonth() + 1).padStart(2, '0');
+    diagPush(day + ' ' + line);
+  }
+
+  // Krótki skrót identyfikatora sesji — pokazuje, czy serwer wydał nową sesję,
+  // bez zapisywania samego identyfikatora.
+  function sessionTag() {
+    const m = document.cookie.match(/(?:^|;\s*)PHPSESSID=([^;]+)/);
+    if (!m) return 'brak ciasteczka';
+    let h = 0;
+    for (const c of m[1]) h = (Math.imul(h, 31) + c.charCodeAt(0)) >>> 0;
+    return h.toString(36).slice(-4);
+  }
+
+  function navigationInfo() {
+    const nav = performance.getEntriesByType?.('navigation')?.[0];
+    let from = '(brak)';
+    if (document.referrer) {
+      try {
+        const ref = new URL(document.referrer);
+        from = ref.origin === location.origin ? ref.pathname : ref.origin;
+      } catch { from = '(?)'; }
+    }
+    return 'typ ' + (nav ? nav.type : '?') + ', z ' + from;
+  }
+
+  function injectMode() {
+    try {
+      return (typeof GM_info !== 'undefined' && GM_info.injectInto) || '?';
+    } catch {
+      return '?';
+    }
   }
 
   function runPart(part, fn) {
@@ -96,21 +183,38 @@
     });
 
     GM_registerMenuCommand('Pokaż log debug (Multilab)', () => {
-      alert(DEBUG_LOG.join('\n') || '(pusty log)');
+      const lines = diagRead();
+      alert(lines.length ? lines.slice(-80).join('\n') : (DEBUG_LOG.join('\n') || '(pusty log)'));
     });
+  }
+
+  // Komunikaty strony logowania widoczne dla użytkownika: „Błędne dane…”
+  // (ctl0_Main_validationMessage, ukryty przez visibility:hidden), walidatory
+  // pól (ctl0_Main_ctl0/ctl1) i captcha (ctl0_Main_pCaptcha). Wg strony z 06.11.2026.
+  function visibleLoginMessages() {
+    const parts = [];
+    for (const id of ['ctl0_Main_validationMessage', 'ctl0_Main_ctl0', 'ctl0_Main_ctl1']) {
+      const el = document.getElementById(id);
+      const text = normalizeText(el?.textContent);
+      if (text && isVisible(el)) parts.push('„' + text + '”');
+    }
+    const captcha = document.getElementById('ctl0_Main_pCaptcha');
+    if (isVisible(captcha)) parts.push('captcha');
+    return parts.join(', ');
   }
 
   function autoLogin() {
     const findUsernameField = () => document.getElementById('ctl0_Main_username');
     const findPasswordField = () => document.getElementById('ctl0_Main_password');
     const findSubmitButton = () => document.getElementById('ctl0_Main_ctl4');
-    const findErrorMessage = () => document.getElementById('ctl0_Main_ctl5');
 
     const isLoginForm = () => isVisible(findUsernameField()) && isVisible(findPasswordField());
 
     function hasVisibleError() {
-      const err = findErrorMessage();
-      return isVisible(err) && (err.textContent || '').trim().length > 0;
+      const msg = visibleLoginMessages();
+      if (!msg) return false;
+      dbg('login', 'na stronie: ' + msg);
+      return true;
     }
 
     let attempted = false;
@@ -160,8 +264,9 @@
   }
 
   // ───────────── keepAlive ─────────────
-  // Serwer (PHP) kończy sesję po okresie bezczynności, domyślnie 24 min. Każde
-  // zapytanie z ciasteczkiem sesji liczy ten czas od nowa, więc w tle co kilka
+  // Serwer (PHP) kończy sesję po okresie bezczynności (dokładny czas nieznany;
+  // PHP domyślnie 24 min). Każde zapytanie z ciasteczkiem sesji liczy ten czas
+  // od nowa, więc w tle co kilka
   // minut pobieramy /page,Home — bez przeładowania strony i utraty wyszukiwania.
   // Gdy sesja mimo to wygaśnie (uśpiony komputer, brak sieci), serwer odpowiada
   // przekierowaniem na /page,login — wtedy przeładowujemy stronę i autoLogin
@@ -181,13 +286,16 @@
   function keepAlive() {
     let lastPingAt = Date.now(); // samo załadowanie strony odświeżyło sesję
     let timer = null;
+    let dueAt = 0;
     let inFlight = false;
     let reloading = false;
+    let lastTag = sessionTag();
 
     function schedule(delayMs) {
       clearTimeout(timer);
       if (reloading) return;
-      timer = setTimeout(() => ping('co ' + Math.round(KEEPALIVE.pingEveryMs / 60_000) + ' min'), delayMs);
+      dueAt = Date.now() + delayMs;
+      timer = setTimeout(() => ping('co ' + Math.round(KEEPALIVE.pingEveryMs / 60_000) + ' min', true), delayMs);
     }
 
     function readLastReload() {
@@ -225,10 +333,12 @@
       return true;
     }
 
-    async function ping(reason) {
+    async function ping(reason, fromTimer) {
       if (inFlight || reloading) return;
       inFlight = true;
       let nextDelay = KEEPALIVE.pingEveryMs;
+      const late = fromTimer ? Date.now() - dueAt : 0;
+      const t0 = Date.now();
       const ctrl = new AbortController();
       const abortTimer = setTimeout(() => ctrl.abort(), KEEPALIVE.pingTimeoutMs);
       try {
@@ -237,12 +347,22 @@
           cache: 'no-store',
           signal: ctrl.signal,
         });
-        await res.text();
+        const html = await res.text();
         lastPingAt = Date.now();
+        const tag = sessionTag();
+        const details = 'HTTP ' + res.status + ', ' + new URL(res.url).pathname +
+          (res.redirected ? ' (przekierowanie)' : '') + ', ' + Math.round(html.length / 1024) + ' kB, ' +
+          (Date.now() - t0) + ' ms' +
+          (html.includes('ctl0_Main_username') ? ', W ODPOWIEDZI FORMULARZ LOGOWANIA' : '') +
+          (late > 5000 ? ', timer spóźniony ' + Math.round(late / 1000) + ' s' : '') +
+          (tag !== lastTag ? ', NOWA SESJA ' + lastTag + ' → ' + tag : '');
+        lastTag = tag;
         if (isLoginUrl(res.url)) {
+          dbg('sesja', 'serwer odesłał na logowanie (' + reason + '): ' + details);
           if (reloadForRelogin()) return;
         } else {
-          dbg('sesja', 'podtrzymana (' + reason + '), HTTP ' + res.status);
+          writeJson(DIAG.lastOkPingKey, { t: Date.now(), path: location.pathname });
+          dbg('sesja', 'podtrzymana (' + reason + '): ' + details);
         }
       } catch (e) {
         nextDelay = KEEPALIVE.retryAfterErrorMs;
@@ -261,14 +381,72 @@
     }
 
     // Po uśpieniu komputera albo przerwie w sieci nie czekamy na kolejny cykl.
+    let hiddenSince = document.hidden ? Date.now() : 0;
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) pingIfOverdue('powrót do karty');
+      if (document.hidden) {
+        hiddenSince = Date.now();
+        return;
+      }
+      if (hiddenSince && Date.now() - hiddenSince >= 60_000) {
+        dbg('karta', 'powrót do karty po ' + Math.round((Date.now() - hiddenSince) / 60_000) +
+          ' min; ostatnie podtrzymanie ' + agoText(lastPingAt));
+      }
+      hiddenSince = 0;
+      pingIfOverdue('powrót do karty');
     });
     window.addEventListener('online', () => pingIfOverdue('powrót sieci'));
+    window.addEventListener('offline', () => dbg('sesja', 'przeglądarka zgłasza brak sieci'));
 
     schedule(KEEPALIVE.pingEveryMs);
     dbg('sesja', 'podtrzymanie włączone — zapytanie w tle co ' +
       Math.round(KEEPALIVE.pingEveryMs / 60_000) + ' min');
+  }
+
+  // ───────────── diagnostyka strony ─────────────
+  // Zapytania XHR samej strony (wyszukiwanie, przyciski „Wynik” — callbacki
+  // PRADO): status, adres po przekierowaniach i czy w odpowiedzi przyszła
+  // strona logowania. Tylko odczyt, nie zmienia zapytań.
+
+  function watchPageRequests() {
+    const W = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const proto = W.XMLHttpRequest?.prototype;
+    if (!proto || proto.__multilabDiag) return;
+    const origSend = proto.send;
+    proto.send = function (...args) {
+      const xhr = this;
+      const t0 = Date.now();
+      xhr.addEventListener('loadend', () => {
+        try {
+          let path = '?';
+          try { path = new URL(xhr.responseURL).pathname; } catch { /* brak adresu */ }
+          let text = '';
+          try {
+            if (xhr.responseType === '' || xhr.responseType === 'text') text = xhr.responseText || '';
+          } catch { /* odpowiedź nietekstowa */ }
+          const login = path.startsWith('/page,login') || text.includes('ctl0_Main_username');
+          dbg('strona', 'XHR ' + xhr.status + ' ' + path + ', ' + Math.round(text.length / 1024) + ' kB, ' +
+            (Date.now() - t0) + ' ms' + (login ? ' — ODPOWIEDŹ TO STRONA LOGOWANIA' : ''));
+        } catch { /* diagnostyka nie może psuć strony */ }
+      });
+      return origSend.apply(this, args);
+    };
+    proto.__multilabDiag = true;
+  }
+
+  function logPageStart() {
+    dbg('start', 'wersja ' + (typeof GM_info !== 'undefined' ? GM_info.script?.version : '?') +
+      ', tryb ' + injectMode() + ', ' + location.pathname + ', ' + navigationInfo() +
+      ', sesja ' + sessionTag());
+    window.addEventListener('pagehide', () => {
+      writeJson(DIAG.lastLeaveKey, { t: Date.now(), path: location.pathname });
+    });
+  }
+
+  function logLoginArrival() {
+    const ok = readJson(DIAG.lastOkPingKey);
+    const leave = readJson(DIAG.lastLeaveKey);
+    dbg('login', 'strona logowania; ostatnie udane podtrzymanie ' + agoText(ok?.t) +
+      ', poprzednia strona opuszczona ' + agoText(leave?.t) + (leave?.path ? ' (' + leave.path + ')' : ''));
   }
 
   // ───────────── dataOd ─────────────
@@ -471,12 +649,19 @@
   // ───────────── start ─────────────
 
   function boot() {
-    if (IS_TOP_WINDOW) runPart('menu', registerMenu);
+    if (IS_TOP_WINDOW) {
+      runPart('start', logPageStart);
+      runPart('menu', registerMenu);
+    }
     if (IS_LOGIN_PAGE) {
+      if (IS_TOP_WINDOW) runPart('login', logLoginArrival);
       runPart('login', autoLogin);
       return;
     }
-    if (IS_TOP_WINDOW) runPart('sesja', keepAlive);
+    if (IS_TOP_WINDOW) {
+      runPart('strona', watchPageRequests);
+      runPart('sesja', keepAlive);
+    }
     if (IS_HOME_PAGE) runPart('data od', dataOd);
   }
 
