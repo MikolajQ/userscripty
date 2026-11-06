@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.132.0
+// @version      3.133.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, po podpisie DANE WIZYTY), przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -875,7 +875,7 @@
   //  - Serum wczytuje ją dopiero po kliknięciu zakładki IPOM, więc przy
   //    otwarciu wizyty pobieramy ją sami w tle (ipomStronie, ~5 KB, ~170 ms).
   // O roku decyduje „Data utworzenia” (decyzja użytkownika 05.11.2026).
-  // Zielona: IPOM-y są, ale żaden z bieżącego roku. Czerwona: jest z bieżącego.
+  // Zielona: nowy rok kalendarzowy i ≥10 mies. od ostatniego IPOM-u. Czerwona: reszta.
   // Brak IPOM-ów — brak etykiety.
 
   // Kod strony: zapytanie Serum (uf_promise, bez przesłony) tak jak w
@@ -934,7 +934,7 @@
     }
     if (kol < 0) return 'brak kolumny „Data utworzenia”';
     const rok = String(new Date().getFullYear());
-    const wynik = { ile: 0, wRoku: 0, rok, ostatni: '' };
+    const wynik = { ile: 0, wRoku: 0, rok, ostatni: '', ostRok: 0, ostMies: 0, ostDzien: 0, zielona: false };
     let ostatniRmd = '';
     for (const tr of tabela.rows) {
       if (tr === naglowek) continue;
@@ -943,7 +943,18 @@
       wynik.ile++;
       if (m[3] === rok) wynik.wRoku++;
       const rmd = m[3] + m[2] + m[1];
-      if (rmd > ostatniRmd) { ostatniRmd = rmd; wynik.ostatni = m[1] + '-' + m[2] + '-' + m[3]; }
+      if (rmd > ostatniRmd) {
+        ostatniRmd = rmd; wynik.ostatni = m[1] + '-' + m[2] + '-' + m[3];
+        wynik.ostRok = +m[3]; wynik.ostMies = +m[2]; wynik.ostDzien = +m[1];
+      }
+    }
+    // Zielona (czas na nowy IPOM): nowy rok kalendarzowy względem ostatniego
+    // IPOM-u ORAZ upłynęło co najmniej 10 miesięcy od jego utworzenia.
+    if (wynik.ile) {
+      const dz = new Date();
+      const mies = (dz.getFullYear() - wynik.ostRok) * 12 + (dz.getMonth() + 1 - wynik.ostMies) -
+        (dz.getDate() < wynik.ostDzien ? 1 : 0);
+      wynik.zielona = wynik.ostRok < dz.getFullYear() && mies >= 10;
     }
     return wynik;
   }
@@ -951,7 +962,7 @@
   function ipomUstaw(w, skad) {
     ipomWynik = w;
     dbg('modIpomEtykieta: ' + skad + ' — IPOM: ' + w.ile + ', z ' + w.rok + ': ' + w.wRoku +
-      (w.ile ? ' → etykieta ' + (w.wRoku ? 'czerwona' : 'zielona') : ' → bez etykiety'));
+      (w.ile ? ' → etykieta ' + (w.zielona ? 'zielona' : 'czerwona') : ' → bez etykiety'));
     rysujEtykieteIpom();
   }
 
@@ -969,15 +980,19 @@
       el.id = IPOM_ETYKIETA_ID;
       el.textContent = 'IPOM';
       el.style.cssText = 'display:inline-block;margin-left:12px;padding:0 7px;border-radius:3px;' +
-        'color:#fff;font:bold 10pt/1.6 sans-serif;letter-spacing:.5px;vertical-align:1px;cursor:default';
+        'color:#000;font:bold 10pt/1.6 sans-serif;letter-spacing:.5px;vertical-align:1px;cursor:default';
       td.appendChild(el);
     }
-    const tytul = w.wRoku
-      ? 'IPOM w ' + w.rok + ' już był (ostatni utworzony ' + w.ostatni + ')'
-      : 'W ' + w.rok + ' nie było jeszcze IPOM (ostatni utworzony ' + w.ostatni + ')';
+    const tytul = w.zielona
+      ? 'Można wystawić nowy IPOM: nowy rok i minęło ≥10 mies. (ostatni utworzony ' + w.ostatni + ')'
+      : w.wRoku
+        ? 'IPOM w ' + w.rok + ' już był (ostatni utworzony ' + w.ostatni + ')'
+        : 'Jeszcze nie minęło 10 mies. od ostatniego IPOM (utworzony ' + w.ostatni + ')';
     if (el.title !== tytul) {
       el.title = tytul;
-      el.style.background = w.wRoku ? '#c62828' : '#2e7d32';
+      // Użytkownik pracuje z inwersją kolorów (pełna, invert(100%)), więc
+      // wpisujemy dopełnienia: na ekranie wychodzi czerwony #c62828 / zielony #2e7d32.
+      el.style.background = w.zielona ? '#d182cd' : '#39d7d7';
     }
   }
 
