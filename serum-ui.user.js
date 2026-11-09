@@ -1,16 +1,19 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.136.0
+// @version      3.137.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na kartkę A4), przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_setClipboard
 // @grant        unsafeWindow
+// @grant        GM_getResourceText
+// @resource     pdfjsLib https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
+// @resource     pdfjsWorker https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js
 // @run-at       document-start
 // @noframes
 // ==/UserScript==
@@ -23,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.136.0';
+  const SCRIPT_VERSION = '3.137.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -5279,6 +5282,212 @@
     mierz('lab:pozycjonowanie', () => positionLabCopyBtn(labCopyBtnEl));
   }
 
+  // --- ZLECENIE (laboratorium): „Zapisz i drukuj” (3.137) ---
+  // Dane: zlecenie-diag 09.11 (~/serum-audyt/zlecenie-diag.js). Pasek okna
+  // ZLECENIE (div.przegladarka, span.h3_tytul#zlecenie) to td.ll z
+  //   <a href="javascript:f_zapisz_zlecenie(id,'');" class="a_akc" name="przycisk_zapisz_zlecenie_lab">Zapisz</a>
+  //   <a class="a_akc" href="javascript:f_dodaj_pers_zewn();">Dodaj pers. zew</a>
+  // Po „Zapisz” Serum SAMO otwiera podgląd: po ~300 ms (zapisz →
+  // zapisz_drugi_poziom) w tym samym oknie pojawia się iframe#wydruka z
+  // /pdf/wydruk_xml_fo/Skierowanie do laboratorium.pdf?fo=…skierowanie_lab_male.
+  // PDF (Apache FOP 0.95): strony 281×595 pt = 99×210 mm (⅓ A4), wektorowy,
+  // tyle stron, ile wymaga lista badań.
+  // Okna drukowania przeglądarki nie da się ustawić z zewnątrz: „Strony na
+  // kartkę” Firefox 159 nie zapamiętuje w ogóle (print.js:
+  // _nonFlaggedUpdatePreviewSettings — bez preferencji), a ramka z PDF-em
+  // jest dla strony niedostępna. Dlatego układ powstaje w samym dokumencie
+  // do druku: strony PDF-a rysuje pdf.js (dołączony jako @resource, ładowany
+  // dopiero przy pierwszym kliknięciu), a o układzie decyduje CSS według
+  // papieru wybranego w oknie drukowania (zapytanie @media liczone dla
+  // obszaru strony): papier szeroki na dwie strony (A4, Letter) → dwie strony
+  // obok siebie w skali ~1:1; węższy (koperta DL w M209dw) → jedna na kartkę.
+  // W oknie drukowania nic nie trzeba zmieniać — zostaje „Drukuj”/Enter.
+  const ZD_DPI = 600;                 // rozdzielczość rastra stron (test: ~/serum-audyt/test-druk)
+  const ZD_PODGLAD_LIMIT_MS = 20000;  // tyle czekamy na podgląd po „Zapisz”
+  let zdPraca = false;
+  let zdPdfjs = null;                 // Promise biblioteki pdf.js (raz na stronę)
+  let zdRamkaDruku = null;
+
+  function zdZaladujPdfjs() {
+    if (zdPdfjs) return zdPdfjs;
+    zdPdfjs = new Promise((resolve) => {
+      const t0 = performance.now();
+      // Oba pliki pdf.js to UMD: z podanym `module` oddają eksport, a przy
+      // okazji przypisują globalThis.pdfjsLib / globalThis.pdfjsWorker w tym
+      // samym kontekście. Z globalThis.pdfjsWorker pdf.js 3.11 pracuje w
+      // wątku głównym (PDFWorker._mainThreadWorkerMessageHandler) — bez
+      // Workera i adresów blob:, których zachowanie zależy od kontekstu
+      // menedżera skryptów. Przy 1–3 stronach 99×210 mm to bez znaczenia.
+      const wykonaj = (nazwa) => {
+        const kod = GM_getResourceText(nazwa);
+        if (!kod) throw new Error('brak zasobu @resource ' + nazwa);
+        const m = { exports: {} };
+        new Function('module', 'exports', kod + '\n//# sourceURL=serum-ui-' + nazwa + '.js')(m, m.exports);
+        return m.exports;
+      };
+      wykonaj('pdfjsWorker');
+      const lib = wykonaj('pdfjsLib');
+      dbg('zapiszDrukuj: pdf.js ' + lib.version + ' wczytany w ' + Math.round(performance.now() - t0) + ' ms');
+      resolve(lib);
+    });
+    zdPdfjs.catch(() => { zdPdfjs = null; });
+    return zdPdfjs;
+  }
+
+  // >>> druk-uklad (test: ~/serum-audyt/test-druk/uruchom.sh wycina blok od ZD_DPI do zdPodgladyWidoczne)
+  // Strony PDF → obrazy PNG w rozdzielczości `dpi`. Zwraca adresy blob: i wymiary w mm.
+  async function zdRenderujStrony(lib, dane, dpi) {
+    const doc = await lib.getDocument({ data: dane, isEvalSupported: false, verbosity: 0 }).promise;
+    const strony = [];
+    try {
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const vp1 = page.getViewport({ scale: 1 });
+        const vp = page.getViewport({ scale: dpi / 72 });
+        const c = document.createElement('canvas');
+        c.width = Math.ceil(vp.width);
+        c.height = Math.ceil(vp.height);
+        const ctx = c.getContext('2d', { alpha: false });
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, c.width, c.height);
+        await page.render({ canvasContext: ctx, viewport: vp, intent: 'print' }).promise;
+        const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
+        c.width = c.height = 0; // zwolnij pamięć płótna od razu
+        page.cleanup();
+        strony.push({ url: URL.createObjectURL(blob), wMm: vp1.width / 72 * 25.4, hMm: vp1.height / 72 * 25.4, bajty: blob.size });
+      }
+    } finally {
+      doc.destroy();
+    }
+    return strony;
+  }
+
+  // Dokument do druku. Para stron = .ark; czy para stoi obok siebie, czy
+  // każda strona idzie na osobną kartkę, rozstrzyga @media według obszaru
+  // strony. Pomiar sondą (test-druk, 09.11): obszar = papier minus marginesy
+  // z okna drukowania, @page{margin} na to nie wpływa — Firefox z domyślnymi
+  // 0,5″: A4 184×271 mm, DL 84×194 mm; Chromium (marginesy drukarki): A4
+  // 197×271, DL 102×212. vh w ukrytej ramce Firefoksa = 0, więc wysokość
+  // pilnują reguły max-height co 5 mm (najmniejsza pasująca wygrywa).
+  // Podziały stron tylko między blokami (break-after), bez dzielenia flexa.
+  function zdHtmlWydruku(strony, tytul) {
+    const w = Math.max(...strony.map((s) => s.wMm));
+    const h = Math.max(...strony.map((s) => s.hMm));
+    const prog = (1.4 * w).toFixed(1); // dwie obok siebie w skali ≥ 70%: A4 tak, DL i A5 nie
+    let css = '.s{width:' + w.toFixed(2) + 'mm}';
+    for (let mm = Math.ceil(h / 5) * 5 + 5; mm >= 60; mm -= 5) {
+      css += '@media (max-height:' + mm + 'mm){.s{width:' + (w * (mm - 5) / h).toFixed(2) + 'mm}}';
+    }
+    let body = '';
+    for (let i = 0; i < strony.length; i += 2) {
+      body += '<div class="ark">';
+      for (const s of strony.slice(i, i + 2)) body += '<div class="s"><img src="' + s.url + '" alt=""></div>';
+      body += '</div>';
+    }
+    const esc = (t) => String(t).replace(/[&<>"]/g, (z) => '&#' + z.charCodeAt(0) + ';');
+    return '<!doctype html><html><head><meta charset="utf-8"><title>' + esc(tytul) + '</title><style>' +
+      'html,body{margin:0;padding:0;background:#fff}' +
+      '.ark{break-after:page}.ark:last-child{break-after:auto}' +
+      '.s{max-width:100%;margin:0 auto;break-inside:avoid}' +
+      '.s img{display:block;width:100%;height:auto}' + css +
+      '@media (max-width:' + prog + 'mm){.s{break-after:page}.ark:last-child .s:last-child{break-after:auto}}' +
+      '@media (min-width:' + prog + 'mm){.ark{display:flex;justify-content:center}.s{max-width:50%;margin:0;flex:none}}' +
+      '</style></head><body>' + body + '</body></html>';
+  }
+  // <<< druk-uklad
+
+  function zdPosprzataj() {
+    if (!zdRamkaDruku) return;
+    for (const u of zdRamkaDruku.urls) URL.revokeObjectURL(u);
+    zdRamkaDruku.el.remove();
+    zdRamkaDruku = null;
+  }
+
+  async function zdDrukuj(strony) {
+    zdPosprzataj();
+    const el = document.createElement('iframe');
+    el.setAttribute('aria-hidden', 'true');
+    el.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0';
+    zdRamkaDruku = { el, urls: strony.map((s) => s.url) };
+    await new Promise((r) => { el.addEventListener('load', r, { once: true }); el.srcdoc = zdHtmlWydruku(strony, 'Skierowanie do laboratorium'); document.body.appendChild(el); });
+    const win = el.contentWindow;
+    await Promise.all([...el.contentDocument.images].map((img) => img.decode()));
+    // Sprzątanie dopiero po zamknięciu okna drukowania (afterprint) — wcześniej
+    // usunięcie ramki przerwałoby wydruk. Następne zlecenie i tak sprząta.
+    win.addEventListener('afterprint', () => {
+      dbg('zapiszDrukuj: afterprint');
+      zdPosprzataj();
+      closePodgladWydruku();
+    }, { once: true });
+    win.focus();
+    win.print();
+  }
+
+  function zdPodgladyWidoczne() {
+    return wszystkieZId('wydruka').filter((f) => f.tagName === 'IFRAME' && /\/pdf\/.*skierowanie_lab/i.test(f.src) && isOverlayElementVisible(f));
+  }
+
+  async function zapiszIDrukuj(zapiszA) {
+    if (zdPraca) return;
+    zdPraca = true;
+    const t0 = performance.now();
+    const ms = () => Math.round(performance.now() - t0);
+    const kroki = [];
+    try {
+      const lib = zdZaladujPdfjs(); // równolegle z zapisem w Serum
+      lib.catch(() => {});
+      // Tylko podgląd, który pojawi się PO kliknięciu (Serum otwiera go
+      // w miejscu okna ZLECENIE, więc zwykle przed kliknięciem nie ma żadnego).
+      const przed = new Set(zdPodgladyWidoczne());
+      zapiszA.click();
+      const ramka = await new Promise((resolve, reject) => {
+        const iv = setInterval(() => {
+          const f = zdPodgladyWidoczne().find((x) => !przed.has(x));
+          if (f) { clearInterval(iv); resolve(f); }
+          else if (performance.now() - t0 > ZD_PODGLAD_LIMIT_MS) { clearInterval(iv); reject(new Error('podgląd skierowania nie pojawił się w ' + ZD_PODGLAD_LIMIT_MS / 1000 + ' s (zlecenie niezapisane?)')); }
+        }, 100);
+      });
+      kroki.push('podgląd ' + ms());
+      // Ten sam adres co ramka podglądu: force-cache łapie jej odpowiedź
+      // z pamięci podręcznej (odpowiedź jest buforowalna — zlecenie-diag).
+      const odp = await fetch(ramka.src, { cache: 'force-cache', credentials: 'same-origin' });
+      if (!odp.ok) throw new Error('PDF: HTTP ' + odp.status);
+      const dane = new Uint8Array(await odp.arrayBuffer());
+      const rt = performance.getEntriesByName(ramka.src).map((e) => e.initiatorType + ' ' + e.transferSize + ' B').join(', ');
+      kroki.push('PDF ' + dane.length + ' B ' + ms() + ' (RT: ' + (rt || 'brak') + ')');
+      const strony = await zdRenderujStrony(await lib, dane, ZD_DPI);
+      kroki.push(strony.length + ' str. ' + strony.map((s) => s.wMm.toFixed(0) + '×' + s.hMm.toFixed(0) + ' mm/' + Math.round(s.bajty / 1024) + ' kB').join(', ') + ' ' + ms());
+      dbg('zapiszDrukuj: ' + kroki.join(' → ') + ' ms → okno drukowania');
+      await zdDrukuj(strony);
+    } catch (e) {
+      dbg('zapiszDrukuj: BŁĄD po ' + ms() + ' ms (' + kroki.join(' → ') + '): ' + (e?.stack || e));
+      showToast('Zapisz i drukuj: ' + (e?.message || e), { durationMs: 8000 });
+    } finally {
+      zdPraca = false;
+    }
+  }
+
+  function modZapiszDrukuj() {
+    // getElementsByName — żywa lista, O(1) przy braku okna ZLECENIE.
+    const lista = document.getElementsByName('przycisk_zapisz_zlecenie_lab');
+    for (const zapiszA of lista) {
+      const pasek = zapiszA.parentElement;
+      if (!pasek || pasek.querySelector('a[data-serum-ui="zapisz-drukuj"]')) continue;
+      if (!isOverlayElementVisible(zapiszA)) continue;
+      const a = document.createElement('a');
+      a.className = 'a_akc';
+      a.href = '#';
+      a.dataset.serumUi = 'zapisz-drukuj';
+      a.textContent = 'Zapisz i drukuj';
+      a.addEventListener('click', (e) => { e.preventDefault(); zapiszIDrukuj(zapiszA); });
+      const dodajPers = pasek.querySelector('a[href^="javascript:f_dodaj_pers_zewn"]');
+      pasek.insertBefore(a, dodajPers ? dodajPers.nextSibling : null);
+      // Odstęp jak między przyciskami Serum (białe znaki między <a> w td.ll).
+      pasek.insertBefore(document.createTextNode(' '), a);
+      dbg('modZapiszDrukuj: dodano „Zapisz i drukuj” (' + (dodajPers ? 'po „Dodaj pers. zew”' : 'na końcu paska') + ')');
+    }
+  }
+
   // --- scheduler ---
 
   let uiTimer = null;
@@ -5313,6 +5522,7 @@
     ['modDashboardNav', modDashboardNav],
     ['modHistoriaWizytFiltr', modHistoriaWizytFiltr],
     ['modLabKopiujWyniki', modLabKopiujWyniki],
+    ['modZapiszDrukuj', modZapiszDrukuj],
     ['modPodgladWydrukuFokus', modPodgladWydrukuFokus],
     ['markPatientCells', markPatientCells],
     ['syncTopPager', syncTopPager],
