@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.137.0
+// @version      3.138.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na kartkę A4), przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na kartkę A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.137.0';
+  const SCRIPT_VERSION = '3.138.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -940,14 +940,30 @@
       if (normLabel(naglowek.cells[i].textContent) === 'Data utworzenia') { kol = i; break; }
     }
     if (kol < 0) return 'brak kolumny „Data utworzenia”';
-    const rok = String(new Date().getFullYear());
-    const wynik = { ile: 0, wRoku: 0, rok, ostatni: '', ostRok: 0, ostMies: 0, ostDzien: 0, zielona: false };
+    // „Tworzący” (autor) i „Personel” — dla porady kompleksowej (modIpomPorada).
+    let kolT = -1, kolP = -1;
+    for (let i = 0; i < naglowek.cells.length; i++) {
+      const t = normLabel(naglowek.cells[i].textContent);
+      if (t === 'Tworzący') kolT = i;
+      else if (t === 'Personel') kolP = i;
+    }
+    const teraz = new Date();
+    const rok = String(teraz.getFullYear());
+    const dzis = String(teraz.getDate()).padStart(2, '0') + '-' + String(teraz.getMonth() + 1).padStart(2, '0') + '-' + rok;
+    const wynik = { ile: 0, wRoku: 0, rok, ostatni: '', ostRok: 0, ostMies: 0, ostDzien: 0, zielona: false,
+      dzis: [], bezTworzacego: kolT < 0 };
     let ostatniRmd = '';
     for (const tr of tabela.rows) {
       if (tr === naglowek) continue;
       const m = /^(\d{2})-(\d{2})-(\d{4})\b/.exec(normLabel(tr.cells[kol]?.textContent));
       if (!m) return 'wiersz bez daty utworzenia (komórek: ' + tr.cells.length + ', „' + normLabel(tr.textContent).slice(0, 40) + '”)';
       wynik.ile++;
+      if (m[0] === dzis) {
+        wynik.dzis.push({
+          tworzacy: kolT < 0 ? '' : normLabel(tr.cells[kolT]?.textContent),
+          personel: kolP < 0 ? '' : normLabel(tr.cells[kolP]?.textContent),
+        });
+      }
       if (m[3] === rok) wynik.wRoku++;
       const rmd = m[3] + m[2] + m[1];
       if (rmd > ostatniRmd) {
@@ -964,6 +980,128 @@
       wynik.zielona = wynik.ostRok < dz.getFullYear() && mies >= 10;
     }
     return wynik;
+  }
+
+  // --- IPOM z dziś → „Porada kompleksowa” w ŚWIADCZENIACH (3.138) ---
+  // Prośba użytkownika 09.11: gdy pacjent ma IPOM utworzony DZIŚ, a jego
+  // autorem („Tworzący” na liście IPOM) jest osoba prowadząca wizytę
+  // („Personel” w nagłówku), produkt jednostkowy = Porada kompleksowa.
+  // Dane: produkt-diag 09.11 (~/serum-audyt/produkt-diag.js):
+  //   <select id="sel_poz_produkt" onchange="f_poz_ustaw_domkod_swiad();f_wiz_swiad_onchange_prod_jedn();">
+  //   opcja: kod="5.01.00.0000197" „(5.01.00.0000197) Porada kompleksowa”, idkodswproc="413"
+  // onchange działa lokalnie (bez zapytań): ustawia sw_wiz_kod_swiadczenia
+  // (413 = „22 Osoba objęta opieką koordynowaną”) i przez f_poz_odswiez_pola
+  // CZYŚCI produkty dodatkowe (#poz_prod_dod_table, g_j_poz_prod_dod). Każdy
+  // produkt dodatkowy ma tam span[iddomks] (tak je liczy f_kod_sw_sprawdz_roznice).
+  // Dlatego: produkty dodane przez modProceduryDodatkowe dokładamy po zmianie
+  // od nowa; gdy są też inne (ręczne) — nie zmieniamy, tylko informujemy.
+  // Lista IPOM-ów przychodzi z modIpomEtykieta (w tle przy otwarciu wizyty,
+  // ponownie po podpisaniu IPOM-u), więc IPOM wystawiony w tej wizycie też się liczy.
+  const IPOM_PORADA_KOD = '5.01.00.0000197';
+  const IPOM_PORADA_MAX_PROB = 3;   // Serum przywróciło inny produkt? Nie walczymy w nieskończoność.
+  let ipomPoradaKlucz = '';
+  let ipomPoradaStan = '';          // '' | 'ręcznie' | 'pominięte'
+  let ipomPoradaProby = 0;
+  let ipomPoradaAutor = null;       // { wynik, ok, opis } — ocena autora dla ipomWynik
+  const ipomPoradaSluchane = new WeakSet();
+
+  // Imię i nazwisko jako zbiór słów (litery, małe), bez numeru PWZ i kolejności.
+  function slowaNazwiska(t) {
+    return (String(t).toLowerCase().match(/\p{L}+/gu) || []).filter((w) => w.length > 1);
+  }
+
+  // Tekst pola „Personel” z nagłówka wizyty: w tym samym wierszu co ukryte
+  // wiz_e_personel_w (id osoby, wymagane przez Serum przy zmianie zakładek).
+  function personelWizyty() {
+    const tr = document.getElementById('wiz_e_personel_w')?.closest('tr');
+    if (!tr) return null;
+    for (const inp of tr.querySelectorAll('input')) {
+      if (inp.type !== 'text' || !inp.value) continue;
+      if (isOverlayElementVisible(inp)) return normLabel(inp.value);
+    }
+    return null;
+  }
+
+  function ipomPoradaOcenAutora(w) {
+    if (ipomPoradaAutor?.wynik === w) return ipomPoradaAutor;
+    let ok = false, opis;
+    const personel = personelWizyty();
+    if (w.bezTworzacego) opis = 'brak kolumny „Tworzący” na liście IPOM';
+    else if (!personel) opis = 'brak pola „Personel” w nagłówku wizyty';
+    else {
+      const mojeSlowa = new Set(slowaNazwiska(personel));
+      const autorzy = w.dzis.map((d) => d.tworzacy);
+      ok = autorzy.some((a) => { const sl = slowaNazwiska(a); return sl.length >= 2 && sl.every((x) => mojeSlowa.has(x)); });
+      opis = 'Tworzący dziś: ' + autorzy.map((a) => '„' + a + '”').join(', ') + '; Personel wizyty: „' + personel + '”';
+    }
+    // Personel nieznany jeszcze (nagłówek w trakcie rysowania) — bez zapamiętania.
+    const wynik = { wynik: w, ok, opis };
+    if (personel || w.bezTworzacego) ipomPoradaAutor = wynik;
+    return wynik;
+  }
+
+  function modIpomPorada() {
+    const w = ipomWynik;
+    if (!ipomKlucz || !w) return;
+    if (ipomPoradaKlucz !== ipomKlucz) {
+      ipomPoradaKlucz = ipomKlucz;
+      ipomPoradaStan = '';
+      ipomPoradaProby = 0;
+    }
+    if (ipomPoradaStan || !w.dzis?.length) return;
+    const sel = document.getElementById('sel_poz_produkt');
+    if (!sel || !isOverlayElementVisible(sel)) return;
+    // Ręczna zmiana produktu (zdarzenie od użytkownika) kończy automat w tej wizycie.
+    if (!ipomPoradaSluchane.has(sel)) {
+      ipomPoradaSluchane.add(sel);
+      const klucz = ipomKlucz;
+      sel.addEventListener('change', (e) => {
+        if (!e.isTrusted || ipomPoradaKlucz !== klucz || ipomPoradaStan) return;
+        ipomPoradaStan = 'ręcznie';
+        dbg('modIpomPorada: produkt zmieniony ręcznie na „' + normLabel(sel.options[sel.selectedIndex]?.text) + '” — nie zmieniam w tej wizycie');
+      });
+    }
+    if (sel.options[sel.selectedIndex]?.getAttribute('kod') === IPOM_PORADA_KOD) return;
+
+    const autor = ipomPoradaOcenAutora(w);
+    if (!autor.ok) { ipomDbgRaz('modIpomPorada: IPOM z dziś, ale bez zmiany produktu — ' + autor.opis); return; }
+
+    const opcja = [...sel.options].findIndex((o) => o.getAttribute('kod') === IPOM_PORADA_KOD);
+    if (opcja < 0) { ipomPoradaStan = 'pominięte'; dbg('modIpomPorada: brak opcji kod=' + IPOM_PORADA_KOD + ' w produktach'); return; }
+
+    // Produkty dodatkowe znikną przy zmianie — dokładamy tylko te, które
+    // sami dodaliśmy; przy innych nie ruszamy produktu.
+    const tabDod = document.getElementById('poz_prod_dod_table');
+    const ileDod = tabDod ? tabDod.querySelectorAll('span[iddomks]').length : 0;
+    const nasze = [...procDodDodanePrzezNas].filter(proceduraJuzDodana);
+    if (ileDod > nasze.length || (!ileDod && tabDod?.firstElementChild)) {
+      ipomPoradaStan = 'pominięte';
+      dbg('modIpomPorada: IPOM z dziś, ale są produkty dodatkowe spoza automatu (span[iddomks]: ' + ileDod +
+        ', naszych: ' + nasze.length + ') — produkt bez zmian');
+      showToast('IPOM z dziś: zmień produkt na „Porada kompleksowa” ręcznie — zmiana usunie dodane produkty dodatkowe', { durationMs: 8000 });
+      return;
+    }
+
+    if (++ipomPoradaProby > IPOM_PORADA_MAX_PROB) {
+      ipomPoradaStan = 'pominięte';
+      dbg('modIpomPorada: produkt wraca na „' + normLabel(sel.options[sel.selectedIndex]?.text) + '” po ' + IPOM_PORADA_MAX_PROB + ' próbach — przestaję');
+      return;
+    }
+    const przed = normLabel(sel.options[sel.selectedIndex]?.text);
+    sel.selectedIndex = opcja;
+    sel.dispatchEvent(new Event('change', { bubbles: true })); // onchange Serum: kod świadczenia + odświeżenie pól
+    const kodSw = document.getElementById('sw_wiz_kod_swiadczenia');
+    dbg('modIpomPorada: „' + przed + '” → „' + normLabel(sel.options[sel.selectedIndex]?.text) + '” (' + autor.opis +
+      '); kod świadczenia: „' + normLabel(kodSw?.options[kodSw.selectedIndex]?.text) + '”' +
+      (nasze.length ? '; dokładam ponownie: ' + nasze.join(', ') : ''));
+    showToast('IPOM z dziś — produkt: Porada kompleksowa', { anchorRect: sel.getBoundingClientRect(), durationMs: 4000 });
+    if (nasze.length) {
+      // Zniknęły przez zmianę produktu, nie ręcznie: bez wpisu do „usuniętych”
+      // i z nowym sprawdzeniem BADANIA PRZEDMIOTOWEGO (punkt odniesienia skasowany).
+      for (const n of nasze) procDodDodanePrzezNas.delete(n);
+      const opis = document.getElementById('wizb_opis_w');
+      if (opis) { procDodBazowyTekst.delete(opis); zaplanujSprawdzenieProcedur(opis, true); }
+    }
   }
 
   // --- IPOM: sugestia (biała migająca etykieta) ---
@@ -1034,8 +1172,12 @@
   function ipomUstaw(w, skad) {
     ipomWynik = w;
     dbg('modIpomEtykieta: ' + skad + ' — IPOM: ' + w.ile + ', z ' + w.rok + ': ' + w.wRoku +
-      (w.ile ? ' → etykieta ' + (w.zielona ? 'zielona' : 'czerwona') : ' → biała tylko przy kodach ICD z sekcji rozpoznań'));
+      (w.ile ? ' → etykieta ' + (w.zielona ? 'zielona' : 'czerwona') : ' → biała tylko przy kodach ICD z sekcji rozpoznań') +
+      (w.dzis.length ? '; z dziś: ' + w.dzis.length : ''));
     rysujEtykieteIpom();
+    // Lista to zdarzenie danych, nie zmiana DOM strony (etykietę obserwator
+    // pomija) — tick dla modIpomPorada trzeba zamówić samemu.
+    scheduleUi();
   }
 
   function rysujEtykieteIpom() {
@@ -5511,6 +5653,7 @@
     ['modPodpiszIpom', modPodpiszIpom],
     ['modIpomKarta', modIpomKarta],
     ['modIpomEtykieta', modIpomEtykieta],
+    ['modIpomPorada', modIpomPorada],
     ['modEzlaPue', modEzlaPue],
     ['modEzlaPodpis', modEzlaPodpis],
     ['modEzlaOstrzezenieWyslij', modEzlaOstrzezenieWyslij],
@@ -5629,6 +5772,7 @@
     'markPatientCells',
     'modIpomKarta',
     'modIpomEtykieta',
+    'modIpomPorada',
   ]);
   // modLabKopiujWyniki i syncTopPager NIE są tu wymienione celowo: wstrzykują
   // własne elementy do strony, więc muszą się wykonać, żeby je SCHOWAĆ —
