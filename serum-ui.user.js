@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.138.0
+// @version      3.139.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na kartkę A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -1213,7 +1213,11 @@
       : w.wRoku
         ? 'IPOM w ' + w.rok + ' już był (ostatni utworzony ' + w.ostatni + ')'
         : 'Jeszcze nie minęło 10 mies. od ostatniego IPOM (utworzony ' + w.ostatni + ')';
-    if (el.title !== tytul) {
+    // Porównanie z własną kopią, nie z el.title: dymek jQuery UI Serum na czas
+    // najechania czyści title (żeby nie było natywnego), a jego wstawienie
+    // budzi tick — przywrócenie title dawało drugi, natywny dymek po ~1 s.
+    if (el.serumUiTytul !== tytul) {
+      el.serumUiTytul = tytul;
       el.title = tytul;
       // Użytkownik pracuje z inwersją kolorów (pełna, invert(100%)), więc
       // wpisujemy dopełnienia: na ekranie wychodzi czerwony #c62828 / zielony #2e7d32.
