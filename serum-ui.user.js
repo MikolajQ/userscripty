@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.141.0
+// @version      3.142.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na kartkę A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.141.0';
+  const SCRIPT_VERSION = '3.142.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -5542,6 +5542,11 @@
   // 197×271, DL 102×212. vh w ukrytej ramce Firefoksa = 0, więc wysokość
   // pilnują reguły max-height co 5 mm (najmniejsza pasująca wygrywa).
   // Podziały stron tylko między blokami (break-after), bez dzielenia flexa.
+  // Gdy kartka mieści dwie strony obok siebie, a stron jest ≥ 2, @page
+  // wymusza orientację poziomą (życzenie użytkownika 09.11). Zapytanie
+  // liczy się dla papieru z okna drukowania (pionowe A4 → pasuje), więc
+  // wąski papier (DL) zostaje pionowy. Firefox: print.js
+  // _updatePrintPreview przejmuje orientację z @page i chowa przełącznik.
   function zdHtmlWydruku(strony, tytul) {
     const w = Math.max(...strony.map((s) => s.wMm));
     const h = Math.max(...strony.map((s) => s.hMm));
@@ -5549,6 +5554,19 @@
     let css = '.s{width:' + w.toFixed(2) + 'mm}';
     for (let mm = Math.ceil(h / 5) * 5 + 5; mm >= 60; mm -= 5) {
       css += '@media (max-height:' + mm + 'mm){.s{width:' + (w * (mm - 5) / h).toFixed(2) + 'mm}}';
+    }
+    // Orientacja pozioma z @page: zapytania @media liczą się wtedy (Brave,
+    // cichy druk Firefoksa) dalej dla PIONOWEGO papieru z okna drukowania, więc
+    // reguły max-height nie widzą niższej kartki. Wysokość poziomej kartki ≈
+    // szerokość pionowej, stąd drugi zestaw ograniczeń liczony od min-width
+    // (zapas 10 mm na różnice marginesów). Przy papierze już poziomym te
+    // reguły nic nie zmieniają — rządzą max-height.
+    const poziomo = strony.length > 1;
+    let poziomoCss = '';
+    if (poziomo) {
+      for (let mm = Math.ceil(1.4 * w / 5) * 5; mm <= 300; mm += 5) {
+        poziomoCss += '@media (min-width:' + mm + 'mm){.ark .s{max-width:min(50%,' + (w * (mm - 10) / h).toFixed(2) + 'mm)}}';
+      }
     }
     let body = '';
     for (let i = 0; i < strony.length; i += 2) {
@@ -5563,7 +5581,7 @@
       '.s{max-width:100%;margin:0 auto;break-inside:avoid}' +
       '.s img{display:block;width:100%;height:auto}' + css +
       '@media (max-width:' + prog + 'mm){.s{break-after:page}.ark:last-child .s:last-child{break-after:auto}}' +
-      '@media (min-width:' + prog + 'mm){.ark{display:flex;justify-content:center}.s{max-width:50%;margin:0;flex:none}}' +
+      '@media (min-width:' + prog + 'mm){.ark{display:flex;justify-content:center}.s{max-width:50%;margin:0;flex:none}' + (poziomo ? '@page{size:landscape}' : '') + '}' + poziomoCss +
       '</style></head><body>' + body + '</body></html>';
   }
   // <<< druk-uklad
