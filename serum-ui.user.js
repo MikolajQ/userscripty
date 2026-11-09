@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.135.0
+// @version      3.136.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, po podpisie DANE WIZYTY), przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -23,7 +23,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.132.0';
+  const SCRIPT_VERSION = '3.136.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -1172,6 +1172,70 @@
   //    IPOM-u, ser.ipom.copyIPOM), podgląd (previewIpom wyłącza selecty).
   const ipomKartyObsluzone = new WeakSet();
 
+  // --- IPOM: termin każdego nowego wiersza badań i wizyt kontrolnych ---
+  // Z ipomjs.js i zrzutu karty (05.11.2026):
+  //  - badania („Zaplanowane badania diagnostyczne”): każde wybrane badanie —
+  //    autocomplete ICD9, okno ICD9, Słownik (checkboxy i autocomplete) —
+  //    idzie przez ser.ipom.createNewRowIcd9 (wprost przez self albo przez
+  //    globalne createNewRowIcd9 → ser.ipom.createNewRowIcd9); wiersz
+  //    tr.x-ipomExaminationOrderRow ma select.x-ipomExaminationOrderTypeOfTerm,
+  //    2 = „Najszybciej jak to możliwe”, onchange="showOrhideInputExaminationOrder(this)";
+  //  - wizyty kontrolne: „+” → ser.ipom.createNewRowControlVisit, 3 = „Po wykonaniu
+  //    zleconych badań”;
+  //  - szablon i Kopiuj idą przez create…Template z własnym terminem — bez zmian.
+  // ser.ipom to nowa instancja przy każdym wczytaniu karty (ipomjs.js ładowany
+  // synchronicznie z HTML-em karty), metody to jej własne pola, a wywołania
+  // szukają ich na instancji w chwili kliknięcia — owijamy więc pola instancji.
+  function ipomTerminyStronie() {
+    if (window.__serumUiIpomTerminy) return;
+    var zglos = function (tekst) {
+      try { document.dispatchEvent(new CustomEvent('serum-ipom-termin', { detail: tekst })); } catch (e) {}
+    };
+    var ustaw = function (sel, wartosc, tekst) {
+      var opcja = null;
+      for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === wartosc) { opcja = sel.options[i]; break; }
+      }
+      if (!opcja || opcja.text.replace(/\s+/g, ' ').trim() !== tekst) return 'BRAK opcji ' + wartosc + ' = „' + tekst + '”';
+      sel.value = wartosc;
+      sel.dispatchEvent(new Event('change', { bubbles: true }));
+      return '„' + tekst + '”';
+    };
+    var owin = function (ip, metoda, klasa, wartosc, tekst) {
+      var oryg = ip[metoda];
+      var css = '.' + klasa + 'List tr.' + klasa + 'Row select.' + klasa + 'TypeOfTerm';
+      ip[metoda] = function () {
+        var form = document.getElementById('formIPOM');
+        var przed = form ? form.querySelectorAll(css).length : 0;
+        var wynik = oryg.apply(this, arguments);
+        try {
+          var plany = form ? form.querySelectorAll(css) : [];
+          var co = [];
+          for (var i = przed; i < plany.length; i++) co.push(ustaw(plany[i], wartosc, tekst));
+          zglos(metoda + ': ' + (co.join(', ') || 'brak nowego wiersza'));
+        } catch (e) {
+          zglos(metoda + ': wyjątek ' + (e && e.message || e));
+        }
+        return wynik;
+      };
+    };
+    window.__serumUiIpomTerminy = function () {
+      var ip = window.ser && window.ser.ipom;
+      if (!ip || typeof ip.createNewRowIcd9 !== 'function' || typeof ip.createNewRowControlVisit !== 'function') {
+        return 'brak ser.ipom.createNewRowIcd9/createNewRowControlVisit';
+      }
+      if (ip.__serumUiTerminy) return 'ser.ipom już owinięty (stara instancja?)';
+      ip.__serumUiTerminy = true;
+      owin(ip, 'createNewRowIcd9', 'x-ipomExaminationOrder', '2', 'Najszybciej jak to możliwe');
+      owin(ip, 'createNewRowControlVisit', 'x-ipomControlVisit', '3', 'Po wykonaniu zleconych badań');
+      return 'OK';
+    };
+  }
+
+  wstrzyknijDoStrony(ipomTerminyStronie);
+
+  document.addEventListener('serum-ipom-termin', (e) => dbg('modIpomKarta: ' + String(e.detail || '')));
+
   function ipomOpcjaJest(sel, wartosc, tekst) {
     for (const o of sel.options) if (o.value === wartosc) return normLabel(o.text) === tekst;
     return false;
@@ -1188,16 +1252,28 @@
     const pole = (id) => document.getElementById(id)?.value;
     const typ = pole('basicInformationTypeIpom');
     const idIpom = pole('basicInformationIdIpom');
-    let pomin = '';
-    if (typ !== 'I') pomin = 'karta typu „' + typ + '” (nie IPOM)';
-    else if (strat.disabled) pomin = 'podgląd';
-    else if (!idIpom && pole('basicInformationNewIPOM') === 'N') pomin = 'kopia (Serum wypełnia ją z kopiowanego IPOM-u)';
-    if (pomin) {
-      dbg('modIpomKarta: ' + pomin + ' — bez zmian');
+    if (typ !== 'I' || strat.disabled) {
+      dbg('modIpomKarta: ' + (strat.disabled ? 'podgląd' : 'karta typu „' + typ + '” (nie IPOM)') + ' — bez zmian');
       return;
     }
 
+    // Terminy nowych wierszy — także w kopii (badania dodane ręcznie), i przed
+    // naszym „+” poniżej, żeby ten wiersz też przeszedł przez owinięcie.
     const zrobione = [];
+    const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    let terminy;
+    try {
+      terminy = typeof uw.__serumUiIpomTerminy === 'function' ? uw.__serumUiIpomTerminy() : 'brak kodu strony';
+    } catch (e) {
+      terminy = 'wyjątek: ' + (e?.message || e);
+    }
+    if (terminy !== 'OK') zrobione.push('terminy nowych wierszy NIEAKTYWNE — ' + terminy);
+    if (!idIpom && pole('basicInformationNewIPOM') === 'N') {
+      zrobione.unshift('kopia (Serum wypełnia ją z kopiowanego IPOM-u) — bez stratyfikacji i wizyty');
+      dbg('modIpomKarta: ' + zrobione.join(', '));
+      return;
+    }
+
     if (strat.value === '') {
       if (ipomOpcjaJest(strat, 'S', 'stabilny')) {
         strat.value = 'S';
@@ -1207,10 +1283,12 @@
       }
     }
     if (!form.querySelector('tr.x-ipomControlVisitRow')) {
-      plus.click();
+      plus.click(); // przez owinięte createNewRowControlVisit — termin już ustawiony
       const plan = form.querySelector('tr.x-ipomControlVisitRow select.x-ipomControlVisitTypeOfTerm');
       if (!plan) {
         zrobione.push('po „+” brak wiersza wizyty kontrolnej');
+      } else if (plan.value === '3') {
+        zrobione.push('wizyta kontrolna „Po wykonaniu zleconych badań”');
       } else if (!ipomOpcjaJest(plan, '3', 'Po wykonaniu zleconych badań')) {
         zrobione.push('wizyta kontrolna dodana, BRAK opcji 3 = „Po wykonaniu zleconych badań”');
       } else {
