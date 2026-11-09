@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.140.0
+// @version      3.141.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na kartkę A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.138.0';
+  const SCRIPT_VERSION = '3.141.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -5455,46 +5455,68 @@
   const ZD_DPI = 600;                 // rozdzielczość rastra stron (test: ~/serum-audyt/test-druk)
   const ZD_PODGLAD_LIMIT_MS = 20000;  // tyle czekamy na podgląd po „Zapisz”
   let zdPraca = false;
-  let zdPdfjs = null;                 // Promise biblioteki pdf.js (raz na stronę)
+  let zdPdfjs = null;                 // { ramka, obietnica } — pdf.js w czystej ramce (raz na stronę)
   let zdRamkaDruku = null;
 
   function zdZaladujPdfjs() {
-    if (zdPdfjs) return zdPdfjs;
-    zdPdfjs = new Promise((resolve) => {
+    // Ramkę mógł usunąć ktoś inny (np. podmiana treści przez Serum) — wtedy
+    // jej świat JS przepadł razem z pdf.js i trzeba go postawić od nowa.
+    if (zdPdfjs && zdPdfjs.ramka?.isConnected) return zdPdfjs.obietnica;
+    zdPdfjs?.ramka?.remove();
+    const ramka = document.createElement('iframe');
+    zdPdfjs = { ramka, obietnica: null };
+    zdPdfjs.obietnica = new Promise((resolve) => {
       const t0 = performance.now();
+      // pdf.js działa w osobnej, pustej ramce (about:blank, ta sama domena),
+      // a nie w świecie strony: Prototype.js Serum dopisuje do Array.prototype
+      // wyliczalne metody (each, collect, …) i podmienia Array.from/entries,
+      // a „worker” pdf.js odmawia wtedy pracy („The `Array.prototype` contains
+      // unexpected enumerable properties” — 09.11, pierwszy prawdziwy wydruk).
+      // Pusta ramka ma własne, czyste Array/Object/Promise; jej Function
+      // wykonuje kod pdf.js z globalThis = okno ramki.
       // Oba pliki pdf.js to UMD: z podanym `module` oddają eksport, a przy
-      // okazji przypisują globalThis.pdfjsLib / globalThis.pdfjsWorker w tym
-      // samym kontekście. Z globalThis.pdfjsWorker pdf.js 3.11 pracuje w
-      // wątku głównym (PDFWorker._mainThreadWorkerMessageHandler) — bez
-      // Workera i adresów blob:, których zachowanie zależy od kontekstu
-      // menedżera skryptów. Przy 1–3 stronach 99×210 mm to bez znaczenia.
+      // okazji przypisują globalThis.pdfjsLib / globalThis.pdfjsWorker (tu:
+      // w ramce). Z globalThis.pdfjsWorker pdf.js 3.11 pracuje w wątku
+      // głównym (PDFWorker._mainThreadWorkerMessageHandler) — bez Workera
+      // i adresów blob:, których zachowanie zależy od kontekstu menedżera
+      // skryptów. Przy 1–3 stronach 99×210 mm to bez znaczenia.
+      ramka.setAttribute('aria-hidden', 'true');
+      ramka.tabIndex = -1;
+      ramka.style.cssText = 'position:fixed;left:-10px;top:-10px;width:0;height:0;border:0;visibility:hidden';
+      document.documentElement.appendChild(ramka);
+      const okno = ramka.contentWindow;
       const wykonaj = (nazwa) => {
         const kod = GM_getResourceText(nazwa);
         if (!kod) throw new Error('brak zasobu @resource ' + nazwa);
         const m = { exports: {} };
-        new Function('module', 'exports', kod + '\n//# sourceURL=serum-ui-' + nazwa + '.js')(m, m.exports);
+        new okno.Function('module', 'exports', kod + '\n//# sourceURL=serum-ui-' + nazwa + '.js')(m, m.exports);
         return m.exports;
       };
       wykonaj('pdfjsWorker');
-      const lib = wykonaj('pdfjsLib');
-      dbg('zapiszDrukuj: pdf.js ' + lib.version + ' wczytany w ' + Math.round(performance.now() - t0) + ' ms');
-      resolve(lib);
+      const pdfjs = wykonaj('pdfjsLib');
+      dbg('zapiszDrukuj: pdf.js ' + pdfjs.version + ' wczytany (czysta ramka) w ' + Math.round(performance.now() - t0) + ' ms');
+      resolve({ pdfjs, okno });
     });
-    zdPdfjs.catch(() => { zdPdfjs = null; });
-    return zdPdfjs;
+    zdPdfjs.obietnica.catch(() => { ramka.remove(); if (zdPdfjs?.ramka === ramka) zdPdfjs = null; });
+    return zdPdfjs.obietnica;
   }
 
   // >>> druk-uklad (test: ~/serum-audyt/test-druk/uruchom.sh wycina blok od ZD_DPI do zdPodgladyWidoczne)
   // Strony PDF → obrazy PNG w rozdzielczości `dpi`. Zwraca adresy blob: i wymiary w mm.
+  // `lib` = { pdfjs, okno } z zdZaladujPdfjs: dane i płótna powstają w świecie
+  // ramki pdf.js (jego `instanceof Uint8Array` nie uzna tablicy ze strony).
   async function zdRenderujStrony(lib, dane, dpi) {
-    const doc = await lib.getDocument({ data: dane, isEvalSupported: false, verbosity: 0 }).promise;
+    const { pdfjs, okno } = lib;
+    const bajty = new okno.Uint8Array(dane.length);
+    bajty.set(dane);
+    const doc = await pdfjs.getDocument({ data: bajty, isEvalSupported: false, verbosity: 0 }).promise;
     const strony = [];
     try {
       for (let i = 1; i <= doc.numPages; i++) {
         const page = await doc.getPage(i);
         const vp1 = page.getViewport({ scale: 1 });
         const vp = page.getViewport({ scale: dpi / 72 });
-        const c = document.createElement('canvas');
+        const c = okno.document.createElement('canvas');
         c.width = Math.ceil(vp.width);
         c.height = Math.ceil(vp.height);
         const ctx = c.getContext('2d', { alpha: false });
