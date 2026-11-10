@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.142.0
+// @version      3.143.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS, Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”, dymek z treścią), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.142.0';
+  const SCRIPT_VERSION = '3.143.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -352,6 +352,7 @@
     'serum-ui-clipboard-helper',
     'serum-ui-login-blokada',
     'serum-ui-ipom-etykieta',
+    'serum-ui-sms-kody',
   ]);
 
   // Mutacje, które NIGDY nie interesują żadnego modułu — czysty szum.
@@ -710,6 +711,166 @@
     smsClicked = true;
     dbg('modWyslijSms: klik Wyślij SMS');
     btn.click();
+  }
+
+  // --- eDok (SMS): kody wysłanych SMS-ów nad przyciskiem ---
+  // Dane ze zrzutów sms-diag (10.11.2026) i kodu Serum (window.ZaleceniaEDM):
+  //  - przycisk: <a class="a_akc zal_kody_edokumenty"> w span#wiz_zalecenia_nowe > span.gr1;
+  //    Serum przerysowuje te przyciski (rysuj_przyciski → innerHTML);
+  //  - historię SMS-ów okno „Wysyłka SMS kodów dostępowych” bierze z serwera:
+  //    uf_promise("ap_wizyty_nowe_ext2.edokumenty_sms_lista",
+  //      "p=DEF2]]2[[26]]"+idpacjenta+"[[242]]"+idkontaktu+"[[302]]…"),
+  //    idpacjenta = #wiz_e_pacjent_w, idkontaktu = #hid_idkontaktu;
+  //  - odpowiedź: table.wiersz_niski, wiersz nagłówka z <th>, potem wiersze
+  //    <td>: data wysłania | nr telefonu | treść | status („Wysłany”);
+  //  - treść: „Wystawiono dla Ciebie eRecepte. W aptece przygotuj numer PESEL
+  //    i podaj kod dostepu: 1234” (kod zmyślony).
+  // Okno samo wysyła SMS (modWyslijSms), więc historii nie widać przed
+  // kliknięciem — pobieramy ją w tle raz na wizytę i po każdej wysyłce
+  // (zdarzenie serum-sms-sent). Źródłem jest serwer, więc kody widać na
+  // każdym komputerze i w każdej przeglądarce.
+
+  // Kod strony: zapytanie jak w edokumenty_sms_lista_pokaz, bez przesłony.
+  // Stała [[302]] jest wpisana przez Serum w kod tej samej klasy.
+  function smsStronie() {
+    if (window.__serumUiSmsLista) return;
+    var param302 = null;
+    window.__serumUiSmsLista = function (idpacjenta, idkontaktu, nr) {
+      if (typeof window.uf_promise !== 'function') return 'brak uf_promise';
+      if (param302 === null) {
+        var k = window.ZaleceniaEDM;
+        var m = typeof k === 'function' ? /\[\[302\]\](\d+)/.exec(Function.prototype.toString.call(k)) : null;
+        if (!m) return 'brak [[302]] w ZaleceniaEDM';
+        param302 = m[1];
+      }
+      var t0 = performance.now();
+      var zglos = function (ok, tekst) {
+        try {
+          document.dispatchEvent(new CustomEvent('serum-sms-lista', {
+            detail: nr + '\t' + Math.round(performance.now() - t0) + '\t' + ok + '\t' + tekst,
+          }));
+        } catch (e) {}
+      };
+      window.uf_promise('ap_wizyty_nowe_ext2.edokumenty_sms_lista',
+        'p=DEF2]]2[[26]]' + idpacjenta + '[[242]]' + idkontaktu + '[[302]]' + param302)
+        .then(function (rTxt) { zglos(1, String(rTxt)); }, function (e) { zglos(0, String(e)); });
+      return 'OK';
+    };
+  }
+
+  wstrzyknijDoStrony(smsStronie);
+
+  const SMS_KODY_ID = 'serum-ui-sms-kody';
+  let smsKlucz = '';        // idpacjenta|idkontaktu wizyty, której dotyczy smsKody
+  let smsKody = null;       // [{ kod, n, ok, opis }] albo null = nie wiadomo
+  let smsZapytanie = 0;     // numer ostatniego zapytania; starsze odpowiedzi odpadają
+  let smsPobierz = false;   // pobrać listę przy najbliższym ticku
+  let smsRysowane = null;   // smsKody, z których zbudowano obecne kwadraciki
+
+  // Kody z jednego SMS-a: 4-cyfrowe liczby po słowie „kod”. SMS bez kodu
+  // też jest pokazany (kwadracik „SMS”), żeby wysyłka nie zginęła.
+  function smsGrupuj(wiersze) {
+    const m = new Map();
+    for (const w of wiersze) {
+      const i = w.tresc.search(/kod/i);
+      const kody = i < 0 ? null : w.tresc.slice(i).match(/(?<!\d)\d{4}(?!\d)/g);
+      for (const kod of kody || ['SMS']) {
+        let g = m.get(kod);
+        if (!g) m.set(kod, (g = { kod, n: 0, ok: false, opis: [] }));
+        g.n++;
+        if (w.status === 'Wysłany') g.ok = true;
+        g.opis.push(w.data + ' · ' + w.status + '\n' + w.tresc);
+      }
+    }
+    return [...m.values()];
+  }
+
+  document.addEventListener('serum-sms-lista', (e) => {
+    const d = String(e.detail || '');
+    const t1 = d.indexOf('\t');
+    const t2 = d.indexOf('\t', t1 + 1);
+    const t3 = d.indexOf('\t', t2 + 1);
+    if (Number(d.slice(0, t1)) !== smsZapytanie) return;
+    const ms = d.slice(t1 + 1, t2);
+    const tekst = d.slice(t3 + 1);
+    if (d.slice(t2 + 1, t3) !== '1') {
+      dbg('modSmsKody: lista — błąd po ' + ms + ' ms: ' + tekst.slice(0, 120));
+      return;
+    }
+    const doc = new DOMParser().parseFromString(tekst, 'text/html');
+    const wiersze = [];
+    for (const tr of doc.getElementsByTagName('tr')) {
+      const c = tr.cells;
+      if (c.length < 4 || c[0].tagName !== 'TD') continue;
+      wiersze.push({ data: c[0].textContent.trim(), tresc: c[2].textContent.trim(), status: c[3].textContent.trim() });
+    }
+    smsKody = smsGrupuj(wiersze);
+    dbg('modSmsKody: lista (' + ms + ' ms, ' + tekst.length + ' zn.) — ' + wiersze.length + ' SMS' +
+      (smsKody.length ? ', kody ' + smsKody.map((g) => g.kod + (g.n > 1 ? '×' + g.n : '')).join(' ') : ''));
+    scheduleUi();
+  });
+
+  // Po wysyłce (alert „Wysłano SMS o treści…”) serwer ma już nowy wpis.
+  document.addEventListener('serum-sms-sent', () => {
+    if (!smsKlucz) return;
+    smsPobierz = true;
+    scheduleUi();
+  });
+
+  function modSmsKody() {
+    const btn = document.getElementById('wiz_zalecenia_nowe')?.querySelector('a.zal_kody_edokumenty') || null;
+    const idPac = btn ? document.getElementById('wiz_e_pacjent_w')?.value || '' : '';
+    const idKon = idPac ? document.getElementById('hid_idkontaktu')?.value || '' : '';
+    const klucz = idKon && idKon !== '0' ? idPac + '|' + idKon : '';
+    if (klucz !== smsKlucz) {
+      smsKlucz = klucz;
+      smsKody = null;
+      smsZapytanie++; // odpowiedź dla poprzedniej wizyty odpada
+      smsPobierz = !!klucz;
+    }
+    if (smsPobierz) {
+      smsPobierz = false;
+      const nr = ++smsZapytanie;
+      const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+      let st;
+      try {
+        st = typeof uw.__serumUiSmsLista === 'function' ? uw.__serumUiSmsLista(idPac, idKon, nr) : 'brak kodu strony';
+      } catch (e) {
+        st = 'wyjątek: ' + (e?.message || e);
+      }
+      if (st !== 'OK') dbg('modSmsKody: lista niewysłana — ' + st);
+    }
+
+    let el = document.getElementById(SMS_KODY_ID);
+    if (!btn || !smsKody?.length) {
+      if (el) el.remove();
+      smsRysowane = null;
+      return;
+    }
+    if (el && el.nextElementSibling === btn && smsRysowane === smsKody) return;
+    el?.remove();
+    // Zerowa kotwica tuż przed przyciskiem, kwadraciki wiszą nad nią —
+    // nagłówek ZALECENIA nie zmienia układu.
+    el = document.createElement('span');
+    el.id = SMS_KODY_ID;
+    el.style.cssText = 'position:relative;display:inline-block;width:0;height:0;vertical-align:top';
+    const rzad = document.createElement('span');
+    rzad.style.cssText = 'position:absolute;left:3px;bottom:3px;z-index:5;display:flex;gap:3px;white-space:nowrap';
+    for (const g of smsKody) {
+      const k = document.createElement('span');
+      k.textContent = g.n > 1 ? g.kod + ' ×' + g.n : g.kod;
+      k.title = g.opis.join('\n\n');
+      // Inwersja kolorów u użytkownika: na ekranie zielony (#2e7d32) z białym
+      // tekstem, gdy SMS ma status „Wysłany”; czerwony (#c62828), gdy nie.
+      k.style.cssText = 'padding:0 4px;border-radius:3px;font:bold 9pt/1.5 sans-serif;color:#000;cursor:default;background:' +
+        (g.ok ? '#d182cd' : '#39d7d7');
+      rzad.appendChild(k);
+    }
+    el.appendChild(rzad);
+    // Natywny dymek zamiast jQuery UI Serum (jak etykieta IPOM).
+    el.addEventListener('mouseover', (e) => e.stopPropagation());
+    btn.before(el);
+    smsRysowane = smsKody;
   }
   // --- PODPISZ E-RECEPTĘ (PIN wpisany → klik „Podpisz”) ---
 
@@ -5697,6 +5858,7 @@
     ['modPodpisElektroniczny', modPodpisElektroniczny],
     ['modWynikiOperacji', modWynikiOperacji],
     ['modWyslijSms', modWyslijSms],
+    ['modSmsKody', modSmsKody],
     ['modPodpiszERecepte', modPodpiszERecepte],
     ['modPodpiszIpom', modPodpiszIpom],
     ['modIpomKarta', modIpomKarta],
@@ -5821,6 +5983,7 @@
     'modIpomKarta',
     'modIpomEtykieta',
     'modIpomPorada',
+    'modSmsKody',
   ]);
   // modLabKopiujWyniki i syncTopPager NIE są tu wymienione celowo: wstrzykują
   // własne elementy do strony, więc muszą się wykonać, żeby je SCHOWAĆ —
