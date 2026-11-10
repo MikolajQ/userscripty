@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.143.1
+// @version      3.144.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”, dymek z treścią), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek gdy „Do wysłania” zmieni się w „Wysłany”), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -725,10 +725,13 @@
   //    <td>: data wysłania | nr telefonu | treść | status („Wysłany”);
   //  - treść: „Wystawiono dla Ciebie eRecepte. W aptece przygotuj numer PESEL
   //    i podaj kod dostepu: 1234” (kod zmyślony).
+  //  - po wysyłce Serum (edokumenty_sms_wyslij_i_odswiez) robi alert(rTxt),
+  //    a potem samo pobiera listę i pokazuje okno ponownie (lista_pokaz("T"));
+  //  - status: „Do wysłania” (kolejka) → „Wysłany” po kilku s do kilku min.
   // Okno samo wysyła SMS (modWyslijSms), więc historii nie widać przed
-  // kliknięciem — pobieramy ją w tle raz na wizytę i po każdej wysyłce
-  // (zdarzenie serum-sms-sent). Źródłem jest serwer, więc kody widać na
-  // każdym komputerze i w każdej przeglądarce.
+  // kliknięciem — pobieramy ją w tle raz na wizytę; po wysyłce czytamy listę
+  // z okna Serum, a przy „Do wysłania” pytamy serwer co 3 s do zmiany.
+  // Źródłem jest serwer, więc kody widać na każdym komputerze.
 
   // Kod strony: zapytanie jak w edokumenty_sms_lista_pokaz, bez przesłony.
   // Stała [[302]] jest wpisana przez Serum w kod tej samej klasy.
@@ -761,60 +764,261 @@
   wstrzyknijDoStrony(smsStronie);
 
   const SMS_KODY_ID = 'serum-ui-sms-kody';
-  let smsKlucz = '';        // idpacjenta|idkontaktu wizyty, której dotyczy smsKody
-  let smsKody = null;       // [{ kod, n, ok, opis }] albo null = nie wiadomo
-  let smsZapytanie = 0;     // numer ostatniego zapytania; starsze odpowiedzi odpadają
+  // „Do wysłania” → „Wysłany”: Serum wstawia SMS do kolejki, bramka zabiera
+  // go po kilku sekundach do kilku minut (obserwacja użytkownika 10.11.2026).
+  // Zmiana statusu na serwerze nie rusza DOM-u, więc żaden obserwator jej
+  // nie zobaczy — odpytujemy serwer, ale WYŁĄCZNIE gdy jakiś SMS czeka.
+  const SMS_CO_MS = 3000;               // odpytywanie przy „Do wysłania” (wymóg: ≤ 3–5 s)
+  const SMS_LIMIT_MS = 10 * 60_000;     // dłużej nie czekamy
+  const SMS_SWIEZY_MS = 15 * 60_000;    // starsze „Do wysłania” zastane w wizycie — bez śledzenia
+  const SMS_OKNO_MS = 5000;             // tyle czekamy po wysyłce na listę w oknie Serum
+  const SMS_ZAPYTANIE_MAX_MS = 15_000;  // zapytanie bez odpowiedzi dłużej — uznane za stracone
+  // Pełna inwersja u użytkownika — wpisujemy dopełnienia [tło, tekst].
+  // Na ekranie: zielony #2e7d32 / pomarańczowy #f9a825 / czerwony #c62828.
+  const SMS_KOLOR = {
+    ok: ['#d182cd', '#000'],     // „Wysłany”: zielony, biały tekst
+    czeka: ['#0657da', '#fff'],  // „Do wysłania”: pomarańczowy, czarny tekst
+    blad: ['#39d7d7', '#000'],   // każdy inny status: czerwony, biały tekst
+  };
+  let smsKlucz = '';        // idpacjenta|idkontaktu bieżącej wizyty
+  let smsKody = null;       // [{ kod, n, stan, opis }] bieżącej wizyty albo null = nie wiadomo
+  let smsWidziane = null;   // Set id wierszy bieżącej wizyty z ostatniej listy
   let smsPobierz = false;   // pobrać listę przy najbliższym ticku
   let smsRysowane = null;   // smsKody, z których zbudowano obecne kwadraciki
+  let smsTabela = null;     // ostatnio odczytana tabela z okna Serum
+  let smsPoWysylce = 0;     // Date.now() alertu „Wysłano SMS…”, dopóki nie przyjdzie lista
+  let smsAwaryjne = false;  // po wysyłce już pytaliśmy sami (brak listy w oknie)
+  let smsNr = 0;            // numer kolejnej listy (zapytania i odczytu z okna)
+  const smsZapytania = new Map(); // nr → { klucz, zrodlo, t }
+  const smsOstatni = new Map();   // klucz → nr ostatniej przyjętej listy (starsze odpadają)
+  const smsSledzone = new Map();  // id wiersza → { klucz, kod, tresc, data, od, n }
+  let smsCzujka = null;           // timer odpytywania
 
-  // Kody z jednego SMS-a: 4-cyfrowe liczby po słowie „kod”. SMS bez kodu
-  // też jest pokazany (kwadracik „SMS”), żeby wysyłka nie zginęła.
+  function smsStan(status) {
+    return status === 'Wysłany' ? 'ok' : /^do wys/i.test(status) ? 'czeka' : 'blad';
+  }
+
+  // 4-cyfrowe liczby po słowie „kod”; SMS bez kodu → „SMS”, żeby nie zginął.
+  function smsKodyZ(tresc) {
+    const i = tresc.search(/kod/i);
+    return (i < 0 ? null : tresc.slice(i).match(/(?<!\d)\d{4}(?!\d)/g)) || ['SMS'];
+  }
+
   function smsGrupuj(wiersze) {
     const m = new Map();
     for (const w of wiersze) {
-      const i = w.tresc.search(/kod/i);
-      const kody = i < 0 ? null : w.tresc.slice(i).match(/(?<!\d)\d{4}(?!\d)/g);
-      for (const kod of kody || ['SMS']) {
+      const st = smsStan(w.status);
+      for (const kod of smsKodyZ(w.tresc)) {
         let g = m.get(kod);
-        if (!g) m.set(kod, (g = { kod, n: 0, ok: false, opis: [] }));
+        if (!g) m.set(kod, (g = { kod, n: 0, stan: 'blad', opis: [] }));
         g.n++;
-        if (w.status === 'Wysłany') g.ok = true;
+        // Jeden „Wysłany” wystarcza (pacjent ma kod); inaczej czeka > błąd.
+        if (st === 'ok' || (st === 'czeka' && g.stan === 'blad')) g.stan = st;
         g.opis.push(w.data + ' · ' + w.status + '\n' + w.tresc);
       }
     }
     return [...m.values()];
   }
 
+  // Wiersze <td>: data | telefon | treść | status (nagłówek z <th> odpada).
+  function smsWiersze(korzen) {
+    const wiersze = [];
+    for (const tr of korzen.getElementsByTagName('tr')) {
+      const c = tr.cells;
+      if (c.length < 4 || c[0].tagName !== 'TD') continue;
+      wiersze.push({ data: c[0].textContent.trim(), tresc: c[2].textContent.trim(), status: c[3].textContent.trim() });
+    }
+    return wiersze;
+  }
+
+  // Tabela historii w oknie „Wysyłka SMS kodów…” (zrzut 10.11):
+  // table.pas_naw z #edokumenty_sms_wyslij, zaraz po niej table.wiersz_niski.
+  function smsTabelaOkna() {
+    const t = document.getElementById(SMS_BUTTON_ID)?.closest('table.pas_naw')?.nextElementSibling;
+    return t && t.tagName === 'TABLE' && t.classList.contains('wiersz_niski') ? t : null;
+  }
+
+  function smsCzas(ms) {
+    const s = Math.round(ms / 1000);
+    return s < 60 ? s + ' s' : Math.floor(s / 60) + ' min ' + (s % 60) + ' s';
+  }
+
+  // Jeden dymek na partię komunikatów; kolor najgorszego (błąd > czeka > ok).
+  function smsDymek(kom) {
+    if (!kom.length) return;
+    const stan = kom.some((k) => k[0] === 'blad') ? 'blad' : kom.some((k) => k[0] === 'czeka') ? 'czeka' : 'ok';
+    showToast(kom.map((k) => k[1]).join(' · '), {
+      tlo: SMS_KOLOR[stan][0],
+      kolor: SMS_KOLOR[stan][1],
+      durationMs: stan === 'blad' ? 12_000 : stan === 'ok' ? 8000 : 5000,
+    });
+  }
+
+  function smsWToku(klucz) {
+    const teraz = Date.now();
+    let jest = false;
+    for (const [nr, z] of smsZapytania) {
+      if (teraz - z.t > SMS_ZAPYTANIE_MAX_MS) smsZapytania.delete(nr);
+      else if (z.klucz === klucz) jest = true;
+    }
+    return jest;
+  }
+
+  function smsZapytaj(klucz, zrodlo) {
+    const [idPac, idKon] = klucz.split('|');
+    const nr = ++smsNr;
+    smsZapytania.set(nr, { klucz, zrodlo, t: Date.now() });
+    const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    let st;
+    try {
+      st = typeof uw.__serumUiSmsLista === 'function' ? uw.__serumUiSmsLista(idPac, idKon, nr) : 'brak kodu strony';
+    } catch (e) {
+      st = 'wyjątek: ' + (e?.message || e);
+    }
+    if (st === 'OK') return true;
+    smsZapytania.delete(nr);
+    dbg('modSmsKody: lista niewysłana (' + zrodlo + ') — ' + st);
+    return false;
+  }
+
+  function smsRozstrzygnij(id, s, w, teraz, kom) {
+    smsSledzone.delete(id);
+    const ok = smsStan(w.status) === 'ok';
+    const czas = smsCzas(teraz - s.od);
+    dbg('modSmsKody: ' + s.kod + ' „' + w.status + '” po ' + czas + ' (' + s.n + ' zapytań; data w Serum ' +
+      s.data + (w.data !== s.data ? ' → ' + w.data : '') + ')');
+    kom.push([ok ? 'ok' : 'blad', 'SMS ' + s.kod + (ok ? ' wysłany' : ': „' + w.status + '”') + ' (po ' + czas + ')']);
+  }
+
+  // Lista SMS-ów jednej wizyty — z własnego zapytania albo z okna Serum.
+  function smsPrzyjmij(klucz, nr, wiersze, zrodlo, opis) {
+    if (nr < (smsOstatni.get(klucz) || 0)) return; // spóźniona starsza odpowiedź
+    smsOstatni.set(klucz, nr);
+    const teraz = Date.now();
+    const biezaca = klucz === smsKlucz;
+    const poWysylce = biezaca && smsPoWysylce > 0;
+    const kom = [];
+    const ids = new Set();
+    for (const w of wiersze) {
+      const id = klucz + '|' + w.data + '|' + w.tresc;
+      ids.add(id);
+      const stan = smsStan(w.status);
+      const s = smsSledzone.get(id);
+      if (s) {
+        if (stan !== 'czeka') smsRozstrzygnij(id, s, w, teraz, kom);
+        continue;
+      }
+      // Nowy wiersz po wysyłce: nie było go na poprzedniej liście (albo, gdy
+      // poprzedniej nie mamy, ma datę z ostatnich 2 minut).
+      const nowy = poWysylce && (smsWidziane ? !smsWidziane.has(id)
+        : teraz - new Date(w.data.replace(' ', 'T')).getTime() < 120_000);
+      const kod = smsKodyZ(w.tresc).join(', ');
+      if (stan !== 'czeka') {
+        if (nowy) kom.push([stan, 'SMS ' + kod + (stan === 'ok' ? ' wysłany' : ': „' + w.status + '”')]);
+        if (nowy && stan === 'blad') dbg('modSmsKody: ' + kod + ' po wysyłce „' + w.status + '”');
+        continue;
+      }
+      // „Do wysłania”: świeżo wysłany albo zastany, ale młodszy niż kwadrans.
+      if (!nowy && !(teraz - new Date(w.data.replace(' ', 'T')).getTime() < SMS_SWIEZY_MS)) continue;
+      smsSledzone.set(id, { klucz, kod, tresc: w.tresc, data: w.data, od: nowy ? smsPoWysylce : teraz, n: 0 });
+      dbg('modSmsKody: ' + kod + ' „' + w.status + '” — sprawdzam co ' + SMS_CO_MS / 1000 + ' s (data w Serum ' +
+        w.data + (nowy ? ', po wysyłce' : ', zastany') + ')');
+      if (nowy) kom.push(['czeka', 'SMS ' + kod + ': czeka w kolejce Serum („' + w.status + '”)']);
+    }
+    // Śledzony wiersz zniknął — może Serum przy wysyłce wpisuje nową datę.
+    for (const [id, s] of smsSledzone) {
+      if (s.klucz !== klucz || ids.has(id)) continue;
+      const w = wiersze.find((x) => x.tresc === s.tresc && smsStan(x.status) !== 'czeka');
+      if (w) smsRozstrzygnij(id, s, w, teraz, kom);
+      else {
+        smsSledzone.delete(id);
+        dbg('modSmsKody: ' + s.kod + ' — wiersz zniknął z listy (data w Serum ' + s.data + ')');
+      }
+    }
+    smsDymek(kom);
+    if (biezaca) {
+      const stareKody = smsKody;
+      smsKody = smsGrupuj(wiersze);
+      smsWidziane = ids;
+      if (poWysylce) smsPoWysylce = 0;
+      // Odpytywanie co 3 s nie zapycha dziennika: lista tylko przy zmianie.
+      const zmiana = !stareKody || stareKody.map((g) => g.kod + g.n + g.stan).join() !== smsKody.map((g) => g.kod + g.n + g.stan).join();
+      if (zrodlo !== 'odpytywania' || zmiana) {
+        const statusy = new Map();
+        for (const w of wiersze) statusy.set(w.status, (statusy.get(w.status) || 0) + 1);
+        dbg('modSmsKody: lista z ' + zrodlo + (opis ? ' (' + opis + ')' : '') + ' — ' + wiersze.length + ' SMS' +
+          (smsKody.length ? ', kody ' + smsKody.map((g) => g.kod + (g.n > 1 ? '×' + g.n : '')).join(' ') +
+            ', statusy ' + [...statusy].map(([s, n]) => s + (n > 1 ? '×' + n : '')).join(', ') : ''));
+      }
+      if (zmiana) scheduleUi();
+    }
+    smsCzujkaStart();
+  }
+
+  function smsCzujkaStart() {
+    if (!smsCzujka && smsSledzone.size) smsCzujka = setTimeout(smsCzujkaTik, SMS_CO_MS);
+  }
+
+  function smsCzujkaTik() {
+    smsCzujka = null;
+    const teraz = Date.now();
+    const kom = [];
+    const klucze = new Set();
+    for (const [id, s] of smsSledzone) {
+      if (teraz - s.od > SMS_LIMIT_MS) {
+        smsSledzone.delete(id);
+        dbg('modSmsKody: ' + s.kod + ' nadal „Do wysłania” po ' + smsCzas(teraz - s.od) + ' (' + s.n + ' zapytań) — koniec sprawdzania');
+        kom.push(['blad', 'SMS ' + s.kod + ' nadal czeka w Serum po ' + smsCzas(teraz - s.od)]);
+      } else klucze.add(s.klucz);
+    }
+    smsDymek(kom);
+    // Karta w tle: dymka i tak nikt nie zobaczy — zapytanie po powrocie.
+    if (!document.hidden) {
+      for (const klucz of klucze) {
+        if (smsWToku(klucz) || !smsZapytaj(klucz, 'odpytywania')) continue;
+        for (const s of smsSledzone.values()) if (s.klucz === klucz) s.n++;
+      }
+    }
+    smsCzujkaStart();
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden || !smsCzujka) return;
+    clearTimeout(smsCzujka);
+    smsCzujka = null;
+    smsCzujkaTik();
+  });
+
   document.addEventListener('serum-sms-lista', (e) => {
     const d = String(e.detail || '');
     const t1 = d.indexOf('\t');
     const t2 = d.indexOf('\t', t1 + 1);
     const t3 = d.indexOf('\t', t2 + 1);
-    if (Number(d.slice(0, t1)) !== smsZapytanie) return;
+    const nr = Number(d.slice(0, t1));
+    const z = smsZapytania.get(nr);
+    if (!z) return;
+    smsZapytania.delete(nr);
     const ms = d.slice(t1 + 1, t2);
     const tekst = d.slice(t3 + 1);
     if (d.slice(t2 + 1, t3) !== '1') {
-      dbg('modSmsKody: lista — błąd po ' + ms + ' ms: ' + tekst.slice(0, 120));
+      dbg('modSmsKody: lista (' + z.zrodlo + ') — błąd po ' + ms + ' ms: ' + tekst.slice(0, 120));
       return;
     }
     const doc = new DOMParser().parseFromString(tekst, 'text/html');
-    const wiersze = [];
-    for (const tr of doc.getElementsByTagName('tr')) {
-      const c = tr.cells;
-      if (c.length < 4 || c[0].tagName !== 'TD') continue;
-      wiersze.push({ data: c[0].textContent.trim(), tresc: c[2].textContent.trim(), status: c[3].textContent.trim() });
-    }
-    smsKody = smsGrupuj(wiersze);
-    dbg('modSmsKody: lista (' + ms + ' ms, ' + tekst.length + ' zn.) — ' + wiersze.length + ' SMS' +
-      (smsKody.length ? ', kody ' + smsKody.map((g) => g.kod + (g.n > 1 ? '×' + g.n : '')).join(' ') : ''));
-    scheduleUi();
+    smsPrzyjmij(z.klucz, nr, smsWiersze(doc), z.zrodlo, ms + ' ms, ' + tekst.length + ' zn.');
   });
 
-  // Po wysyłce (alert „Wysłano SMS o treści…”) serwer ma już nowy wpis.
+  // Alert „Wysłano SMS o treści…” (dialogiStrony): Serum zaraz samo pobiera
+  // listę i pokazuje ją w oknie — czytamy ją stamtąd (modSmsKody). Własne
+  // zapytanie tylko, gdy lista w oknie nie pojawi się w SMS_OKNO_MS.
   document.addEventListener('serum-sms-sent', () => {
-    if (!smsKlucz) return;
-    smsPobierz = true;
-    scheduleUi();
+    if (!smsKlucz) {
+      showToast('Wysłano SMS');
+      return;
+    }
+    smsPoWysylce = Date.now();
+    smsAwaryjne = false;
+    setTimeout(scheduleUi, SMS_OKNO_MS + 100);
   });
 
   function modSmsKody() {
@@ -825,20 +1029,30 @@
     if (klucz !== smsKlucz) {
       smsKlucz = klucz;
       smsKody = null;
-      smsZapytanie++; // odpowiedź dla poprzedniej wizyty odpada
+      smsWidziane = null;
+      smsPoWysylce = 0;
+      smsAwaryjne = false;
       smsPobierz = !!klucz;
     }
-    if (smsPobierz) {
-      smsPobierz = false;
-      const nr = ++smsZapytanie;
-      const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-      let st;
-      try {
-        st = typeof uw.__serumUiSmsLista === 'function' ? uw.__serumUiSmsLista(idPac, idKon, nr) : 'brak kodu strony';
-      } catch (e) {
-        st = 'wyjątek: ' + (e?.message || e);
+    if (klucz) {
+      // Okno „Wysyłka SMS kodów…”: Serum wczytuje listę przy otwarciu i po
+      // wysyłce (nowa tabela) — odczyt zamiast własnego zapytania.
+      // Tylko widoczna tabela — ukryte okno mogło zostać po innej wizycie.
+      const tab = smsTabelaOkna();
+      if (tab && tab !== smsTabela && isOverlayElementVisible(tab)) {
+        smsTabela = tab;
+        smsPobierz = false;
+        smsPrzyjmij(klucz, ++smsNr, smsWiersze(tab), 'okna Serum', '');
       }
-      if (st !== 'OK') dbg('modSmsKody: lista niewysłana — ' + st);
+      if (smsPoWysylce && !smsAwaryjne && Date.now() - smsPoWysylce > SMS_OKNO_MS) {
+        smsAwaryjne = true;
+        smsPobierz = true;
+        dbg('modSmsKody: po wysyłce brak listy w oknie Serum przez ' + SMS_OKNO_MS / 1000 + ' s — pytam serwer');
+      }
+    }
+    if (smsPobierz && !smsWToku(klucz)) {
+      smsPobierz = false;
+      smsZapytaj(klucz, smsAwaryjne ? 'serwera po wysyłce' : 'serwera');
     }
 
     let el = document.getElementById(SMS_KODY_ID);
@@ -860,10 +1074,8 @@
       const k = document.createElement('span');
       k.textContent = g.n > 1 ? g.kod + ' ×' + g.n : g.kod;
       k.title = g.opis.join('\n\n');
-      // Inwersja kolorów u użytkownika: na ekranie zielony (#2e7d32) z białym
-      // tekstem, gdy SMS ma status „Wysłany”; czerwony (#c62828), gdy nie.
-      k.style.cssText = 'padding:0 4px;border-radius:3px;font:normal 9pt/1.5 sans-serif;color:#000;cursor:default;background:' +
-        (g.ok ? '#d182cd' : '#39d7d7');
+      const [tlo, tekst] = SMS_KOLOR[g.stan];
+      k.style.cssText = 'padding:0 4px;border-radius:3px;font:normal 9pt/1.5 sans-serif;cursor:default;color:' + tekst + ';background:' + tlo;
       rzad.appendChild(k);
     }
     el.appendChild(rzad);
@@ -2195,8 +2407,8 @@
       position: 'fixed',
       zIndex: '2147483647',
       padding: small ? '4px 9px' : '12px 20px',
-      background: '#2e7d32',
-      color: '#fff',
+      background: opts.tlo || '#2e7d32',
+      color: opts.kolor || '#fff',
       borderRadius: small ? '5px' : '8px',
       boxShadow: '0 4px 14px rgba(0,0,0,.35)',
       font: small ? '600 11px/1.3 system-ui, -apple-system, sans-serif' : '600 14px/1.4 system-ui, -apple-system, sans-serif',
@@ -2222,16 +2434,6 @@
       toast.style.opacity = '0';
       setTimeout(() => toast.remove(), 200);
     }, duration);
-  }
-
-  function showSmsToast() {
-    showToast('Wysłano SMS');
-  }
-
-  function bootSmsToast() {
-    // Zdarzenie „serum-sms-sent” zgłasza moduł dialogów (dialogiStrony,
-    // kontekst strony) po przechwyceniu „Wysłano sms o treści…”.
-    document.addEventListener('serum-sms-sent', showSmsToast, false);
   }
 
   // --- PODPIS ELEKTRONICZNY (CDA): PIN + „Zapamiętaj” → klik „Podpisz” ---
@@ -6635,7 +6837,6 @@
 
   function start() {
     bootLogin();
-    bootSmsToast();
     bootReceptyEsc();
     bootZaswiadczeniaEsc();
     bootIpomEsc();
