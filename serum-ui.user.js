@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.148.0
+// @version      3.149.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -4537,7 +4537,8 @@
   const colCache = new WeakMap();
 
   const rowStyle = document.createElement('style');
-  rowStyle.textContent = 'td.serum-pacjent-hit { cursor: pointer; }';
+  rowStyle.textContent = 'td.serum-pacjent-hit { cursor: pointer; }' +
+    ' #div_pole_historia_lista tr[onmouseover] { cursor: pointer; }';
   document.documentElement.appendChild(rowStyle);
 
   // table.rows/tHead/tBodies to natywne, „gotowe” kolekcje przeglądarki —
@@ -4705,6 +4706,33 @@
     event.stopPropagation();
     dbg('klik wiersz->Edytuj: kolumna=' + cell.cellIndex);
     editBtn.click();
+  }, true);
+
+  // --- HISTORIA POLA (np. „HISTORIA (ROZPOZNANIE OPISOWE)”): klik w wiersz → Wstaw ---
+  //   <div id="div_pole_historia_lista"><table class="wiersz"><tbody>
+  //     <tr class="tr_nieparzysty" onmouseover="jQ(this).addClass('przerwa_over')" …>
+  //       … <td class="td_akcja"><div class="fourBtnHolder"><span>
+  //         <a href="javascript:wiz_f_pole_historia_wstaw('rozpoznanieopis', 620025608)">Wstaw</a>
+  // Jedno nasłuchiwanie kliknięć na dokumencie — zero pracy na tickach.
+  // Zaznaczanie tekstu myszą (przeciągnięcie) nie wstawia.
+  document.addEventListener('click', (event) => {
+    if (event.button !== 0) return;
+    const t = event.target;
+    if (!(t instanceof Element)) return;
+    if (t.closest('a, button, input, select, textarea, label')) return;
+    const row = t.closest('#div_pole_historia_lista tr');
+    if (!row) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && row.contains(sel.anchorNode)) return;
+    let wstaw = null;
+    for (const a of row.querySelectorAll('td.td_akcja a')) {
+      if (normLabel(a.textContent) === 'Wstaw') { wstaw = a; break; }
+    }
+    if (!wstaw) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dbg('historia pola: klik wiersz → Wstaw (' + (wstaw.getAttribute('href') || '').slice(11, 80) + ')');
+    wstaw.click();
   }, true);
 
   // --- MINI PAGINACJA OBOK „FILTRUJ” (kopia paginacji z dołu listy wizyt) ---
