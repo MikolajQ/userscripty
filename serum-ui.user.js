@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.146.0
+// @version      3.147.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek gdy „Do wysłania” zmieni się w „Wysłany”), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -887,7 +887,8 @@
     const czas = smsCzas(teraz - s.od);
     dbg('modSmsKody: ' + s.kod + ' „' + w.status + '” po ' + czas + ' (' + s.n + ' zapytań; data w Serum ' +
       s.data + (w.data !== s.data ? ' → ' + w.data : '') + ')');
-    kom.push([ok ? 'ok' : 'blad', 'SMS ' + s.kod + (ok ? ' wysłany' : ': „' + w.status + '”') + ' (po ' + czas + ')']);
+    // „Wysłany” widać po zielonej etykiecie — dymek tylko przy błędzie (16.11).
+    if (!ok) kom.push(['blad', 'SMS ' + s.kod + ': „' + w.status + '” (po ' + czas + ')']);
   }
 
   // Lista SMS-ów jednej wizyty — z własnego zapytania albo z okna Serum.
@@ -914,7 +915,7 @@
         : teraz - new Date(w.data.replace(' ', 'T')).getTime() < 120_000);
       const kod = smsKodyZ(w.tresc).join(', ');
       if (stan !== 'czeka') {
-        if (nowy) kom.push([stan, 'SMS ' + kod + (stan === 'ok' ? ' wysłany' : ': „' + w.status + '”')]);
+        if (nowy && stan === 'blad') kom.push([stan, 'SMS ' + kod + ': „' + w.status + '”']);
         if (nowy && stan === 'blad') dbg('modSmsKody: ' + kod + ' po wysyłce „' + w.status + '”');
         continue;
       }
@@ -923,7 +924,7 @@
       smsSledzone.set(id, { klucz, kod, tresc: w.tresc, data: w.data, od: nowy ? smsPoWysylce : teraz, n: 0 });
       dbg('modSmsKody: ' + kod + ' „' + w.status + '” — sprawdzam co ' + SMS_CO_MS / 1000 + ' s (data w Serum ' +
         w.data + (nowy ? ', po wysyłce' : ', zastany') + ')');
-      if (nowy) kom.push(['czeka', 'SMS ' + kod + ': czeka w kolejce Serum („' + w.status + '”)']);
+      if (nowy) kom.push(['czeka', 'SMS ' + kod + ' w kolejce Serum']);
     }
     // Śledzony wiersz zniknął — może Serum przy wysyłce wpisuje nową datę.
     for (const [id, s] of smsSledzone) {
@@ -968,7 +969,7 @@
       if (teraz - s.od > SMS_LIMIT_MS) {
         smsSledzone.delete(id);
         dbg('modSmsKody: ' + s.kod + ' nadal „Do wysłania” po ' + smsCzas(teraz - s.od) + ' (' + s.n + ' zapytań) — koniec sprawdzania');
-        kom.push(['blad', 'SMS ' + s.kod + ' nadal czeka w Serum po ' + smsCzas(teraz - s.od)]);
+        // Bez dymka: „Do wysłania” widać po pomarańczowej etykiecie (16.11).
       } else klucze.add(s.klucz);
     }
     smsDymek(kom);
@@ -3255,6 +3256,12 @@
     {
       szukaj: ['p/c anty - tpo', 'p/c anty -tpo', 'p/c anty-tpo', 'p/c anty- tpo'],
       procedura: 'ANTYTPO (PRZECIWCIAŁA PRZECIW PEROKSYDAZIE TARCZYCOWEJ)',
+    },
+    // NT-proBNP, proBNP, pro BNP, NTpoBNP (literówka spotykana w wynikach) —
+    // 5.01.00.0000174, ta sama sekcja opieki koordynowanej (zrzut 16.11).
+    {
+      szukaj: ['probnp', 'pro bnp', 'pro-bnp', 'ntpobnp', 'nt-pobnp', 'nt pobnp'],
+      procedura: 'BNP (NT-PRO-BNP)',
     },
   ];
 
