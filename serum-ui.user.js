@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.145.0
+// @version      3.146.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek gdy „Do wysłania” zmieni się w „Wysłany”), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -3243,6 +3243,18 @@
         'antygen helicobacter pylori w kale',
       ],
       procedura: 'ANTYGEN H.PYLORI W KALE - TEST LABORATORYJNY',
+    },
+    // Multilab wkleja np. „p/c anty - TG  60.30 IU/ml” i „p/c anty -TPO  <8.00
+    // IU/ml” (zrzut 16.11.2026) — różne odstępy wokół myślnika, więc warianty.
+    // Pozycje są w sekcji „BUDŻET POWIERZONY OPIEKI KOORDYNOWANEJ” słownika
+    // (5.01.00.0000179 / 0000177, kod świadczenia 22).
+    {
+      szukaj: ['p/c anty - tg ', 'p/c anty -tg ', 'p/c anty-tg ', 'p/c anty- tg '],
+      procedura: 'ANTYTG (PRZECIWCIAŁA PRZECIW TYREOGLOBULINIE)',
+    },
+    {
+      szukaj: ['p/c anty - tpo', 'p/c anty -tpo', 'p/c anty-tpo', 'p/c anty- tpo'],
+      procedura: 'ANTYTPO (PRZECIWCIAŁA PRZECIW PEROKSYDAZIE TARCZYCOWEJ)',
     },
   ];
 
