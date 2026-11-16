@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.144.0
+// @version      3.145.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek gdy „Do wysłania” zmieni się w „Wysłany”), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -5865,9 +5865,11 @@
   }
 
   // >>> druk-uklad (test: ~/serum-audyt/test-druk/uruchom.sh wycina blok od ZD_DPI do zdPodgladyWidoczne)
-  // Strony PDF → obrazy PNG w rozdzielczości `dpi`. Zwraca adresy blob: i wymiary w mm.
+  // Strony PDF → obrazy PNG w rozdzielczości `dpi`, przycięte do treści + ZD_ZAPAS_MM.
+  // Zwraca adresy blob:, wymiary strony w mm i `tresc` — położenie wycinka na stronie (mm).
   // `lib` = { pdfjs, okno } z zdZaladujPdfjs: dane i płótna powstają w świecie
   // ramki pdf.js (jego `instanceof Uint8Array` nie uzna tablicy ze strony).
+  const ZD_ZAPAS_MM = 3; // biały margines zostawiany wokół treści (cicha strefa kodów)
   async function zdRenderujStrony(lib, dane, dpi) {
     const { pdfjs, okno } = lib;
     const bajty = new okno.Uint8Array(dane.length);
@@ -5886,15 +5888,58 @@
         ctx.fillStyle = '#fff';
         ctx.fillRect(0, 0, c.width, c.height);
         await page.render({ canvasContext: ctx, viewport: vp, intent: 'print' }).promise;
-        const blob = await new Promise((r) => c.toBlob(r, 'image/png'));
-        c.width = c.height = 0; // zwolnij pamięć płótna od razu
         page.cleanup();
-        strony.push({ url: URL.createObjectURL(blob), wMm: vp1.width / 72 * 25.4, hMm: vp1.height / 72 * 25.4, bajty: blob.size });
+        // Odcięcie białych marginesów na płótnie (nie w CSS: obraz wystający
+        // poza ramkę jest dla dzielenia na kartki jedną całością i Brave/Firefox
+        // spychają go na następną kartkę — test 16.11).
+        const t = zdObszarTresci(okno, c) || { x0: 0, y0: 0, x1: 1, y1: 1 };
+        const zap = ZD_ZAPAS_MM / 25.4 * dpi;
+        const sx = Math.max(0, Math.floor(t.x0 * c.width - zap)), sy = Math.max(0, Math.floor(t.y0 * c.height - zap));
+        const sw = Math.min(c.width, Math.ceil(t.x1 * c.width + zap)) - sx, sh = Math.min(c.height, Math.ceil(t.y1 * c.height + zap)) - sy;
+        let wyc = c;
+        if (sw < c.width || sh < c.height) {
+          wyc = okno.document.createElement('canvas');
+          wyc.width = sw; wyc.height = sh;
+          wyc.getContext('2d', { alpha: false }).drawImage(c, sx, sy, sw, sh, 0, 0, sw, sh);
+          c.width = c.height = 0;
+        }
+        const blob = await new Promise((r) => wyc.toBlob(r, 'image/png'));
+        wyc.width = wyc.height = c.width = c.height = 0; // zwolnij pamięć płótna od razu
+        const mm = 25.4 / dpi;
+        strony.push({ url: URL.createObjectURL(blob), wMm: vp1.width / 72 * 25.4, hMm: vp1.height / 72 * 25.4, bajty: blob.size,
+          tresc: { x0: sx * mm, y0: sy * mm, x1: (sx + sw) * mm, y1: (sy + sh) * mm } });
       }
     } finally {
       doc.destroy();
     }
     return strony;
+  }
+
+  // Prostokąt treści strony (ułamki szerokości/wysokości) albo null dla pustej.
+  // Szukane na kopii zmniejszonej 4× (wygładzanie „high” uśrednia, więc cienkie
+  // kreski zostają szare, nie znikają) — pełne getImageData 600 dpi to ~46 MB.
+  function zdObszarTresci(okno, c) {
+    const w = Math.ceil(c.width / 4), h = Math.ceil(c.height / 4);
+    const m = okno.document.createElement('canvas');
+    m.width = w; m.height = h;
+    const x = m.getContext('2d', { alpha: false, willReadFrequently: true });
+    x.imageSmoothingEnabled = true;
+    x.imageSmoothingQuality = 'high';
+    x.drawImage(c, 0, 0, w, h);
+    const d = x.getImageData(0, 0, w, h).data;
+    m.width = m.height = 0;
+    let x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (let y = 0, i = 0; y < h; y++) {
+      for (let xx = 0; xx < w; xx++, i += 4) {
+        if (d[i] < 250 || d[i + 1] < 250 || d[i + 2] < 250) {
+          if (xx < x0) x0 = xx;
+          if (xx > x1) x1 = xx;
+          if (y < y0) y0 = y;
+          y1 = y;
+        }
+      }
+    }
+    return x1 < 0 ? null : { x0: x0 / w, y0: y0 / h, x1: (x1 + 1) / w, y1: (y1 + 1) / h };
   }
 
   // Dokument do druku. Para stron = .ark; czy para stoi obok siebie, czy
@@ -5903,20 +5948,33 @@
   // z okna drukowania, @page{margin} na to nie wpływa — Firefox z domyślnymi
   // 0,5″: A4 184×271 mm, DL 84×194 mm; Chromium (marginesy drukarki): A4
   // 197×271, DL 102×212. vh w ukrytej ramce Firefoksa = 0, więc wysokość
-  // pilnują reguły max-height co 5 mm (najmniejsza pasująca wygrywa).
+  // pilnują reguły max-height co 2 mm (najmniejsza pasująca wygrywa).
   // Podziały stron tylko między blokami (break-after), bez dzielenia flexa.
   // Gdy kartka mieści dwie strony obok siebie, a stron jest ≥ 2, @page
   // wymusza orientację poziomą (życzenie użytkownika 09.11). Zapytanie
   // liczy się dla papieru z okna drukowania (pionowe A4 → pasuje), więc
   // wąski papier (DL) zostaje pionowy. Firefox: print.js
   // _updatePrintPreview przejmuje orientację z @page i chowa przełącznik.
+  // 3.145 (16.11, życzenie użytkownika — litery były za małe): białe marginesy
+  // PDF są odcinane (zdRenderujStrony; tu wspólny prostokąt wycinków, więc
+  // strony zachowują wzajemne położenie jak w oryginale), treść idzie w skali
+  // 1:1, a pomniejszana jest tylko wtedy, gdy nie mieści się w obszarze;
+  // na poziomej kartce każda strona stoi pośrodku swojej połówki — jak
+  // „2 strony na kartkę” z przeglądarki PDF Firefoksa.
   function zdHtmlWydruku(strony, tytul) {
     const w = Math.max(...strony.map((s) => s.wMm));
     const h = Math.max(...strony.map((s) => s.hMm));
-    const prog = (1.4 * w).toFixed(1); // dwie obok siebie w skali ≥ 70%: A4 tak, DL i A5 nie
-    let css = '.s{width:' + w.toFixed(2) + 'mm}';
-    for (let mm = Math.ceil(h / 5) * 5 + 5; mm >= 60; mm -= 5) {
-      css += '@media (max-height:' + mm + 'mm){.s{width:' + (w * (mm - 5) / h).toFixed(2) + 'mm}}';
+    let x0 = w, y0 = h, x1 = 0, y1 = 0; // wspólny prostokąt wycinków wszystkich stron
+    for (const { tresc: t } of strony) {
+      x0 = Math.min(x0, t.x0); y0 = Math.min(y0, t.y0);
+      x1 = Math.max(x1, t.x1); y1 = Math.max(y1, t.y1);
+    }
+    const cw = x1 - x0, ch = y1 - y0;
+    const proc = (v) => (v * 100).toFixed(3) + '%';
+    const prog = (1.4 * cw).toFixed(1); // dwie obok siebie w skali ≥ 70%: A4 tak, DL i A5 nie
+    let css = '.s{width:' + cw.toFixed(2) + 'mm;aspect-ratio:' + cw.toFixed(3) + '/' + ch.toFixed(3) + '}';
+    for (let mm = Math.ceil(ch / 2) * 2 + 2; mm >= 60; mm -= 2) {
+      css += '@media (max-height:' + mm + 'mm){.s{width:' + (cw * (mm - 3) / ch).toFixed(2) + 'mm}}';
     }
     // Orientacja pozioma z @page: zapytania @media liczą się wtedy (Brave,
     // cichy druk Firefoksa) dalej dla PIONOWEGO papieru z okna drukowania, więc
@@ -5927,24 +5985,28 @@
     const poziomo = strony.length > 1;
     let poziomoCss = '';
     if (poziomo) {
-      for (let mm = Math.ceil(1.4 * w / 5) * 5; mm <= 300; mm += 5) {
-        poziomoCss += '@media (min-width:' + mm + 'mm){.ark .s{max-width:min(50%,' + (w * (mm - 10) / h).toFixed(2) + 'mm)}}';
+      for (let mm = Math.ceil(prog / 5) * 5; mm <= 300; mm += 5) {
+        poziomoCss += '@media (min-width:' + mm + 'mm){.ark .s{max-width:min(50%,' + (cw * (mm - 10) / ch).toFixed(2) + 'mm)}}';
       }
     }
     let body = '';
     for (let i = 0; i < strony.length; i += 2) {
       body += '<div class="ark">';
-      for (const s of strony.slice(i, i + 2)) body += '<div class="s"><img src="' + s.url + '" alt=""></div>';
+      for (const { url, tresc: t } of strony.slice(i, i + 2)) {
+        // Wycinek strony w jej miejscu wspólnego prostokąta (marginesy w % liczone od szerokości).
+        body += '<div class="s"><img src="' + url + '" alt="" style="width:' + proc((t.x1 - t.x0) / cw) +
+          ';margin-left:' + proc((t.x0 - x0) / cw) + ';margin-top:' + proc((t.y0 - y0) / cw) + '"></div>';
+      }
       body += '</div>';
     }
     const esc = (t) => String(t).replace(/[&<>"]/g, (z) => '&#' + z.charCodeAt(0) + ';');
     return '<!doctype html><html><head><meta charset="utf-8"><title>' + esc(tytul) + '</title><style>' +
       'html,body{margin:0;padding:0;background:#fff}' +
       '.ark{break-after:page}.ark:last-child{break-after:auto}' +
-      '.s{max-width:100%;margin:0 auto;break-inside:avoid}' +
-      '.s img{display:block;width:100%;height:auto}' + css +
+      '.s{max-width:100%;margin:0 auto;break-inside:avoid;overflow:hidden}' +
+      '.s img{display:block;height:auto}' + css +
       '@media (max-width:' + prog + 'mm){.s{break-after:page}.ark:last-child .s:last-child{break-after:auto}}' +
-      '@media (min-width:' + prog + 'mm){.ark{display:flex;justify-content:center}.s{max-width:50%;margin:0;flex:none}' + (poziomo ? '@page{size:landscape}' : '') + '}' + poziomoCss +
+      '@media (min-width:' + prog + 'mm){.ark{display:flex;justify-content:space-around;align-items:flex-start}.s{max-width:50%;margin:0;flex:none}' + (poziomo ? '@page{size:landscape}' : '') + '}' + poziomoCss +
       '</style></head><body>' + body + '</body></html>';
   }
   // <<< druk-uklad
