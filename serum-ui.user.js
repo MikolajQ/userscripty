@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.147.0
+// @version      3.148.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -1315,18 +1315,21 @@
     }
     if (kol < 0) return 'brak kolumny „Data utworzenia”';
     // „Tworzący” (autor) i „Personel” — dla porady kompleksowej (modIpomPorada).
-    let kolT = -1, kolP = -1;
+    // „Data modyfikacji” — 10 mies. liczone też od niej (prośba 16.11).
+    let kolT = -1, kolP = -1, kolM = -1;
     for (let i = 0; i < naglowek.cells.length; i++) {
       const t = normLabel(naglowek.cells[i].textContent);
       if (t === 'Tworzący') kolT = i;
       else if (t === 'Personel') kolP = i;
+      else if (t === 'Data modyfikacji') kolM = i;
     }
     const teraz = new Date();
     const rok = String(teraz.getFullYear());
     const dzis = String(teraz.getDate()).padStart(2, '0') + '-' + String(teraz.getMonth() + 1).padStart(2, '0') + '-' + rok;
     const wynik = { ile: 0, wRoku: 0, rok, ostatni: '', ostRok: 0, ostMies: 0, ostDzien: 0, zielona: false,
-      dzis: [], bezTworzacego: kolT < 0 };
-    let ostatniRmd = '';
+      dzis: [], bezTworzacego: kolT < 0,
+      zmiana: '', zmRok: 0, zmMies: 0, zmDzien: 0, bezModyfikacji: kolM < 0 };
+    let ostatniRmd = '', zmianaRmd = '';
     for (const tr of tabela.rows) {
       if (tr === naglowek) continue;
       const m = /^(\d{2})-(\d{2})-(\d{4})\b/.exec(normLabel(tr.cells[kol]?.textContent));
@@ -1344,13 +1347,24 @@
         ostatniRmd = rmd; wynik.ostatni = m[1] + '-' + m[2] + '-' + m[3];
         wynik.ostRok = +m[3]; wynik.ostMies = +m[2]; wynik.ostDzien = +m[1];
       }
+      // Ostatnia zmiana: najpóźniejsza z dat utworzenia i modyfikacji
+      // wszystkich IPOM-ów (pusta modyfikacja = tylko utworzenie).
+      const mm = kolM < 0 ? null : /^(\d{2})-(\d{2})-(\d{4})\b/.exec(normLabel(tr.cells[kolM]?.textContent));
+      for (const d of mm ? [m, mm] : [m]) {
+        const r = d[3] + d[2] + d[1];
+        if (r > zmianaRmd) {
+          zmianaRmd = r; wynik.zmiana = d[1] + '-' + d[2] + '-' + d[3];
+          wynik.zmRok = +d[3]; wynik.zmMies = +d[2]; wynik.zmDzien = +d[1];
+        }
+      }
     }
     // Zielona (czas na nowy IPOM): nowy rok kalendarzowy względem ostatniego
-    // IPOM-u ORAZ upłynęło co najmniej 10 miesięcy od jego utworzenia.
+    // utworzenia IPOM-u ORAZ upłynęło co najmniej 10 miesięcy od ostatniej
+    // zmiany (utworzenia lub modyfikacji, od 3.148).
     if (wynik.ile) {
       const dz = new Date();
-      const mies = (dz.getFullYear() - wynik.ostRok) * 12 + (dz.getMonth() + 1 - wynik.ostMies) -
-        (dz.getDate() < wynik.ostDzien ? 1 : 0);
+      const mies = (dz.getFullYear() - wynik.zmRok) * 12 + (dz.getMonth() + 1 - wynik.zmMies) -
+        (dz.getDate() < wynik.zmDzien ? 1 : 0);
       wynik.zielona = wynik.ostRok < dz.getFullYear() && mies >= 10;
     }
     return wynik;
@@ -1546,12 +1560,17 @@
   function ipomUstaw(w, skad) {
     ipomWynik = w;
     dbg('modIpomEtykieta: ' + skad + ' — IPOM: ' + w.ile + ', z ' + w.rok + ': ' + w.wRoku +
-      (w.ile ? ' → etykieta ' + (w.zielona ? 'zielona' : 'czerwona') : ' → biała tylko przy kodach ICD z sekcji rozpoznań') +
+      (w.ile ? ', ostatnia zmiana ' + w.zmiana + (w.bezModyfikacji ? ' (BRAK kolumny „Data modyfikacji”)' : '') +
+        ' → etykieta ' + (w.zielona ? 'zielona' : 'czerwona') : ' → biała tylko przy kodach ICD z sekcji rozpoznań') +
       (w.dzis.length ? '; z dziś: ' + w.dzis.length : ''));
     rysujEtykieteIpom();
     // Lista to zdarzenie danych, nie zmiana DOM strony (etykietę obserwator
     // pomija) — tick dla modIpomPorada trzeba zamówić samemu.
     scheduleUi();
+  }
+
+  function ipomZmianaOpis(w) {
+    return w.zmiana && w.zmiana !== w.ostatni ? ', zmieniony ' + w.zmiana : '';
   }
 
   function rysujEtykieteIpom() {
@@ -1587,10 +1606,10 @@
     const tytul = kodySug
       ? 'Warto rozważyć IPOM: pacjent nie ma jeszcze IPOM, a w rozpoznaniach jest ' + kodySug.join(', ')
       : w.zielona
-      ? 'Można wystawić nowy IPOM: nowy rok i minęło ≥10 mies. (ostatni utworzony ' + w.ostatni + ')'
+      ? 'Można wystawić nowy IPOM: nowy rok i minęło ≥10 mies. (ostatni utworzony ' + w.ostatni + ipomZmianaOpis(w) + ')'
       : w.wRoku
-        ? 'IPOM w ' + w.rok + ' już był (ostatni utworzony ' + w.ostatni + ')'
-        : 'Jeszcze nie minęło 10 mies. od ostatniego IPOM (utworzony ' + w.ostatni + ')';
+        ? 'IPOM w ' + w.rok + ' już był (ostatni utworzony ' + w.ostatni + ipomZmianaOpis(w) + ')'
+        : 'Jeszcze nie minęło 10 mies. od ostatniego utworzenia lub modyfikacji IPOM (utworzony ' + w.ostatni + ipomZmianaOpis(w) + ')';
     // Porównanie z własną kopią, nie z el.title: dymek jQuery UI Serum na czas
     // najechania czyści title (żeby nie było natywnego), a jego wstawienie
     // budzi tick — przywrócenie title dawało drugi, natywny dymek po ~1 s.
