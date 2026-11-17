@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.149.0
+// @version      3.150.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.143.1';
+  const SCRIPT_VERSION = '3.150.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -4538,7 +4538,8 @@
 
   const rowStyle = document.createElement('style');
   rowStyle.textContent = 'td.serum-pacjent-hit { cursor: pointer; }' +
-    ' #div_pole_historia_lista tr[onmouseover] { cursor: pointer; }';
+    ' #div_pole_historia_lista tr[onmouseover] { cursor: pointer; }' +
+    ' #tab_zlecenia_lab tr.serum-lab-edytuj > td:not(.td_akcja) { cursor: pointer; }';
   document.documentElement.appendChild(rowStyle);
 
   // table.rows/tHead/tBodies to natywne, „gotowe” kolekcje przeglądarki —
@@ -4733,6 +4734,56 @@
     event.stopPropagation();
     dbg('historia pola: klik wiersz → Wstaw (' + (wstaw.getAttribute('href') || '').slice(11, 80) + ')');
     wstaw.click();
+  }, true);
+
+  // --- LABORATORIUM (lista zleceń): klik w wiersz → Edytuj ---
+  //   <div id="div_lista_zlecen"><table id="tab_zlecenia_lab" class="wiersz przyklej_dwa przyklejone"><tbody>
+  //     <tr id="tr_zlecenie_<id>" class="tr_parzysty tr_zlecenie" data-ile_wynikow_badan="0">
+  //       <td>2</td> <td class="l"></td> <td class="l">NFZ</td> … <td class="p">445,00</td>
+  //       <td class="td_akcja"><div class="fourBtnHolder"><span>…</span><span>…</span>
+  //         <span><a href="javascript:f_js_lab_zlecenie('189',<id>,<id2>,'wizyty_nowe');">Edytuj</a></span>
+  //         <span>…</span></div>
+  //         <span class="showInfo" onclick="…uf_stop_bubble(event);">…</span><span class="userInfoBox" …>
+  // Zlecenia już wysłane mają w tym miejscu „Wyniki” zamiast „Edytuj” — takich
+  // wierszy nie ruszamy. Cała kolumna akcji (przyciski, checkbox, „+”) i każdy
+  // klikalny element zostają po staremu. Bez stopPropagation: wiersz nie ma
+  // własnego onclick, więc nic nie trzeba tłumić, a nie połykamy obsługi Serum
+  // z elementów, których nie znamy. Kursor „rączka” — tylko na wierszach
+  // z „Edytuj”, oznaczanych leniwie przy pierwszym najechaniu (każdy wiersz
+  // sprawdzany raz, zero pracy na tickach).
+  const LAB_WIERSZ = '#tab_zlecenia_lab tr.tr_zlecenie';
+  const labSprawdzone = new WeakSet();
+
+  function labEdytuj(row) {
+    for (const a of row.querySelectorAll('td.td_akcja a')) {
+      if (normLabel(a.textContent) === 'Edytuj') return a;
+    }
+    return null;
+  }
+
+  document.addEventListener('mouseover', (event) => {
+    const t = event.target;
+    if (!(t instanceof Element)) return;
+    const row = t.closest(LAB_WIERSZ);
+    if (!row || labSprawdzone.has(row)) return;
+    labSprawdzone.add(row);
+    if (labEdytuj(row)) row.classList.add('serum-lab-edytuj');
+  }, { passive: true });
+
+  document.addEventListener('click', (event) => {
+    if (event.button !== 0 || event.detail > 1) return;
+    const t = event.target;
+    if (!(t instanceof Element)) return;
+    const row = t.closest(LAB_WIERSZ);
+    if (!row) return;
+    const klikalny = t.closest('a, button, input, select, textarea, label, [onclick], td.td_akcja');
+    if (klikalny && row.contains(klikalny)) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && row.contains(sel.anchorNode)) return;
+    const edytuj = labEdytuj(row);
+    if (!edytuj) return;
+    dbg('laboratorium: klik wiersz → Edytuj (' + row.id + ')');
+    edytuj.click();
   }, true);
 
   // --- MINI PAGINACJA OBOK „FILTRUJ” (kopia paginacji z dołu listy wizyt) ---
