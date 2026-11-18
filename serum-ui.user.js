@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.151.0
+// @version      3.152.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.151.0';
+  const SCRIPT_VERSION = '3.152.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -4193,7 +4193,7 @@
   // zdarzenie (regresja z 217 próbek, odchylenie 1 ms). Przy 1000 kopiach
   // jedno zdarzenie scroll trwało 31–38 ms, czyli prawie każde dłużej niż
   // klatka. Handlery trzymają też w pamięci całe stare tabele, a 1000 kopii
-  // w body to dodatkowe ~17 tys. elementów (także w przelocie tabeleStrony).
+  // w body to dodatkowe ~17 tys. elementów (dawniej także w przelocie tabeleStrony).
   // Kod wtyczki ze strony (serum_diag_kod_v1, jQuery 1.12.1): dla tabeli poza
   // dokumentem offset() i height() dają 0, więc jej handler scroll tylko chowa
   // kopię. Usunięcie kopii razem z handlerami niczego na ekranie nie zmienia.
@@ -4587,8 +4587,8 @@
     return wynik;
   }
 
-  // markPatientCells i jestListaWizytNaStronie przelatują TĘ SAMĄ listę tabel
-  // na każdym ticku i pytają o to samo. Pamięć jest TRWAŁA (nie tylko na
+  // markPatientCells, jestListaWizytNaStronie i klik w komórkę pytają o to
+  // samo (kandydat z tabeleStrony albo kliknięta tabela). Pamięć jest TRWAŁA (nie tylko na
   // tick), unieważniana podmianą wiersza nagłówka lub zmianą liczby wierszy —
   // ten sam problem co przy tabeli zleceń: .textContent nagłówka
   // tabeli-layoutu serializuje ogromne poddrzewo, a tabela-layout nigdy nie
@@ -4762,8 +4762,8 @@
   // querySelectorAll('#id') idzie przez indeks id dokumentu — stałe ~0,4 µs
   // niezależnie od wielkości DOM-u (2–60 tys. węzłów) i liczby tabel, zwraca też
   // duplikaty; tabela bez zmian 0,07 µs; oznaczenie nowej (10 wierszy) 8,5 µs.
-  // Pętla po wszystkich tabelach w tabeleStrony byłaby droższa (porównanie id
-  // dla każdej tabeli), dlatego tu osobne zapytanie.
+  // tabeleStrony().lab to tylko PIERWSZA tabela, a tu potrzebne wszystkie —
+  // stąd osobne zapytanie (ten sam indeks id, ten sam koszt).
   const LAB_WIERSZ = '#tab_zlecenia_lab tr.tr_zlecenie';
   const LAB_EDYTUJ = 'td.td_akcja a[href^="javascript:f_js_lab_zlecenie("]';
   const labOznaczone = new WeakMap(); // tabela → { wiersze (żywa lista), n }
@@ -5444,8 +5444,8 @@
 
   function findLabOrdersTable() {
     // Bez bramki po tekście całego <body> — ta wymagała serializacji ~10 mln
-    // znaków. Tabele klasyfikuje jeden wspólny przelot na tick (tabeleStrony),
-    // a ocena każdej tabeli jest zapamiętana (labOrdersTableCache).
+    // znaków. Tabelę wskazuje id (tabeleStrony, raz na tick), a ocena
+    // nagłówka jest zapamiętana (labOrdersTableCache).
     return tabeleStrony().lab;
   }
 
@@ -6275,17 +6275,33 @@
   const uiTickErrLogged = new Set();
 
   // Lista wizyt (markPatientCells, mini-paginacja) i tabela zleceń
-  // LABORATORIUM — JEDEN przelot po tabelach strony na tick zamiast osobnego
-  // dla każdego modułu. getElementsByTagName to żywa lista trzymana przez
-  // przeglądarkę (bez kopiowania do tablicy), a ocena każdej tabeli jest
-  // zapamiętana per tabela. Pamięć tylko w obrębie jednego uiTick().
+  // LABORATORIUM — szukane po miejscu w DOM, nie przelotem po tabelach strony.
+  // Dane (zrzuty serum-diag 27.10–10.11, 41 stanów ekranu): lista wizyt to
+  // ZAWSZE tabela bezpośrednio w div#lista (70/70, div#lista jeden na stronę),
+  // tabela zleceń to ZAWSZE table#tab_zlecenia_lab (69/69; bywa ich kilka —
+  // wizyta i podsumowanie pacjenta — bierzemy pierwszą w kolejności dokumentu,
+  // jak dawniej). Reszta trafień reguły po nagłówku to kopie przyklejonych
+  // nagłówków w body i tabele panelu wizyty (skierowania, dokumenty), gdzie klik
+  // i tak był blokowany przez isEdycjaWizytyOpen. Nagłówek nadal sprawdzamy
+  // (isWizytyListTable/isLabOrdersTable) — to samo id w innym oknie Serum.
+  // Pomiar: dawny przelot po wszystkich tabelach to krok lab:findLabOrdersTable
+  // w logach z 12 sesji 03–09.11: 0,22–0,45 ms na tick, 45,8 s z 278,9 s całego
+  // ticka (16%, najdroższy krok skryptu). Benchmark (Firefox 159, 1:1 ta sama
+  // klasyfikacja, 7,8–40 tys. el., 183–426 tabel, ~/serum-audyt/test-ipom/
+  // bench-tabele.html): stary 50–104 µs, po wstawieniu tabeli do DOM 128–768 µs;
+  // nowy 0,8–1,2 µs niezależnie od wielkości strony. Pamięć w obrębie uiTick().
   let tabeleTickCache = null;
   function tabeleStrony() {
     if (tabeleTickCache) return tabeleTickCache;
     const wynik = { wizyty: [], lab: null };
-    for (const t of document.getElementsByTagName('table')) {
-      if (isWizytyListTable(t)) wynik.wizyty.push(t);
-      if (!wynik.lab && isLabOrdersTable(t)) wynik.lab = t;
+    const lista = document.getElementById('lista');
+    if (lista) {
+      for (const t of lista.children) {
+        if (t.tagName === 'TABLE' && isWizytyListTable(t)) wynik.wizyty.push(t);
+      }
+    }
+    for (const t of document.querySelectorAll('#tab_zlecenia_lab')) {
+      if (isLabOrdersTable(t)) { wynik.lab = t; break; }
     }
     if (visCache) tabeleTickCache = wynik;
     return wynik;
