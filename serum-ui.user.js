@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.150.0
+// @version      3.151.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.150.0';
+  const SCRIPT_VERSION = '3.151.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -4737,38 +4737,47 @@
   }, true);
 
   // --- LABORATORIUM (lista zleceń): klik w wiersz → Edytuj ---
-  //   <div id="div_lista_zlecen"><table id="tab_zlecenia_lab" class="wiersz przyklej_dwa przyklejone"><tbody>
+  // Dane: lab-wiersz-diag 18.11.2026 (~/serum-audyt/lab-wiersz-diag.js, 30 min pracy):
+  //   <table id="tab_zlecenia_lab" data-formatka_div="sekcja_laboratorium"><tbody>
   //     <tr id="tr_zlecenie_<id>" class="tr_parzysty tr_zlecenie" data-ile_wynikow_badan="0">
-  //       <td>2</td> <td class="l"></td> <td class="l">NFZ</td> … <td class="p">445,00</td>
-  //       <td class="td_akcja"><div class="fourBtnHolder"><span>…</span><span>…</span>
-  //         <span><a href="javascript:f_js_lab_zlecenie('189',<id>,<id2>,'wizyty_nowe');">Edytuj</a></span>
-  //         <span>…</span></div>
-  //         <span class="showInfo" onclick="…uf_stop_bubble(event);">…</span><span class="userInfoBox" …>
-  // Zlecenia już wysłane mają w tym miejscu „Wyniki” zamiast „Edytuj” — takich
-  // wierszy nie ruszamy. Cała kolumna akcji (przyciski, checkbox, „+”) i każdy
-  // klikalny element zostają po staremu. Bez stopPropagation: wiersz nie ma
-  // własnego onclick, więc nic nie trzeba tłumić, a nie połykamy obsługi Serum
-  // z elementów, których nie znamy. Kursor „rączka” — tylko na wierszach
-  // z „Edytuj”, oznaczanych leniwie przy pierwszym najechaniu (każdy wiersz
-  // sprawdzany raz, zero pracy na tickach).
+  //       <td>…</td> ×19 (tekst, span[title] z dymkiem, h3 statusu — bez linków i onclick)
+  //       <td class="td_akcja"><div class="fourBtnHolder">
+  //         <span><a href="javascript:f_szczegoly_zlecenia(…)">Pokaż</a></span>
+  //         <span><a … onclick="f_dodaj_do_wizyty(…)">Dołącz<input type="checkbox" …></a></span>
+  //         <span><a href="javascript:f_js_lab_zlecenie('189',<id>,<id2>,'wizyty_nowe');">Edytuj</a></span> …
+  //         </div><span class="showInfo" onclick="…">+</span><span class="userInfoBox">…Usuń…</span></td>
+  // „Edytuj” (f_js_lab_zlecenie) mają tylko niewysłane zlecenia; wysłane mają
+  // w tym miejscu „Wyniki” albo nic — żaden inny link wiersza nie woła tej
+  // funkcji, więc rozpoznanie po href jest dokładne (bez czytania tekstu).
+  // Serum NIE zmienia wierszy na miejscu: po Zapisz/Dodaj/zamknięciu wizyty
+  // podmienia CAŁĄ tabelę (czasem z div#div_lista_zlecen), więc każdą tabelę
+  // wystarczy oznaczyć raz — liczba wierszy w kluczu to tylko bezpiecznik.
+  // Tabel o tym id bywa kilka naraz (wizyta + okno podsumowania pacjenta,
+  // zrzut 03.11; Serum samo szuka ich przez table[id=tab_zlecenia_lab]).
+  // Na wierszu i komórkach Serum nie podpina zdarzeń; na document ma tylko
+  // chowanie dymków i menu — dlatego bez stopPropagation (dymek ma zniknąć).
+  // Nasłuch mouseover z 3.150 zastąpiony oznaczaniem w ticku (pomiar w Serum:
+  // 57 zdarzeń/min po 0,44 µs — mało, ale to był jedyny stały koszt funkcji).
+  // Koszt kroku (Firefox 159, ~/serum-audyt/test-ipom/bench-lab-*.html):
+  // querySelectorAll('#id') idzie przez indeks id dokumentu — stałe ~0,4 µs
+  // niezależnie od wielkości DOM-u (2–60 tys. węzłów) i liczby tabel, zwraca też
+  // duplikaty; tabela bez zmian 0,07 µs; oznaczenie nowej (10 wierszy) 8,5 µs.
+  // Pętla po wszystkich tabelach w tabeleStrony byłaby droższa (porównanie id
+  // dla każdej tabeli), dlatego tu osobne zapytanie.
   const LAB_WIERSZ = '#tab_zlecenia_lab tr.tr_zlecenie';
-  const labSprawdzone = new WeakSet();
+  const LAB_EDYTUJ = 'td.td_akcja a[href^="javascript:f_js_lab_zlecenie("]';
+  const labOznaczone = new WeakMap(); // tabela → { wiersze (żywa lista), n }
 
-  function labEdytuj(row) {
-    for (const a of row.querySelectorAll('td.td_akcja a')) {
-      if (normLabel(a.textContent) === 'Edytuj') return a;
+  function modLabWierszEdytuj() {
+    for (const t of document.querySelectorAll('#tab_zlecenia_lab')) {
+      const z = labOznaczone.get(t);
+      if (z && z.wiersze.length === z.n) continue;
+      const wiersze = z ? z.wiersze : t.getElementsByClassName('tr_zlecenie');
+      labOznaczone.set(t, { wiersze, n: wiersze.length });
+      // klasa na TR to szum dla obserwatora (isNoiseMutation) — nie wywoła ticka
+      for (const r of wiersze) r.classList.toggle('serum-lab-edytuj', !!r.querySelector(LAB_EDYTUJ));
     }
-    return null;
   }
-
-  document.addEventListener('mouseover', (event) => {
-    const t = event.target;
-    if (!(t instanceof Element)) return;
-    const row = t.closest(LAB_WIERSZ);
-    if (!row || labSprawdzone.has(row)) return;
-    labSprawdzone.add(row);
-    if (labEdytuj(row)) row.classList.add('serum-lab-edytuj');
-  }, { passive: true });
 
   document.addEventListener('click', (event) => {
     if (event.button !== 0 || event.detail > 1) return;
@@ -4780,7 +4789,7 @@
     if (klikalny && row.contains(klikalny)) return;
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed && row.contains(sel.anchorNode)) return;
-    const edytuj = labEdytuj(row);
+    const edytuj = row.querySelector(LAB_EDYTUJ);
     if (!edytuj) return;
     dbg('laboratorium: klik wiersz → Edytuj (' + row.id + ')');
     edytuj.click();
@@ -6256,6 +6265,7 @@
     ['modDashboardNav', modDashboardNav],
     ['modHistoriaWizytFiltr', modHistoriaWizytFiltr],
     ['modLabKopiujWyniki', modLabKopiujWyniki],
+    ['modLabWierszEdytuj', modLabWierszEdytuj],
     ['modZapiszDrukuj', modZapiszDrukuj],
     ['modPodgladWydrukuFokus', modPodgladWydrukuFokus],
     ['markPatientCells', markPatientCells],
@@ -6361,6 +6371,7 @@
     'modDashboardNav',
     'modHistoriaWizytFiltr',
     'markPatientCells',
+    'modLabWierszEdytuj',
     'modIpomKarta',
     'modIpomEtykieta',
     'modIpomPorada',
