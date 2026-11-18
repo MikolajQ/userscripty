@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.152.0
+// @version      3.153.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.152.0';
+  const SCRIPT_VERSION = '3.153.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -2262,34 +2262,52 @@
   // id="a_akc" onclick="uf_schowaj_div();f_ezla_nadajserienr(...)">Wyślij</a>).
   // Inne, nieznane jeszcze warianty „OSTRZEŻENIE” mogą wymagać realnej
   // decyzji użytkownika, więc lepiej ich nie dotykać.
-  // Kolejność: najpierw link (selektor po onclick), a tekst strony dopiero,
-  // gdy widoczny link istnieje — dawniej tekst całego <body> był bramką
-  // na KAŻDYM ticku.
+  // Kolejność: najpierw link, treść dopiero, gdy widoczny link istnieje.
   const EZLA_OSTRZEZENIE_TEXT = 'przerwa między zwolnieniami';
   let ezlaOstrzezenieClicked = false;
 
-  function findEzlaOstrzezenieWyslij() {
-    for (const el of document.querySelectorAll('[onclick*="f_ezla_nadajserienr"]')) {
-      if (el.tagName !== 'A' && el.tagName !== 'BUTTON') continue;
-      if (normLabel(el.textContent) !== 'Wyślij') continue;
-      if (!isOverlayElementVisible(el)) continue;
-      return el;
+  // Kształt okna z kodu Serum (f_ezla_waliduj2, zrzut ~/Pobrane/
+  // serum-ezla-zrodla.txt 19.10): uf_pokaz_div(zhtml,…,"T") wstawia do td.nopm
+  //   <table id="tb_komunikat_div" class="form">…treść…</table>
+  //   <table class="pas_naw">…<a class="a_akc" onclick="uf_schowaj_div();
+  //     f_ezla_nadajserienr(id)">Wyślij</a><a …>Anuluj</a>…</table>
+  // i to jedyne miejsce w źródłach z f_ezla_nadajserienr w onclick. Dlatego
+  // szukamy przez indeks id (#tb_komunikat_div) i dopiero w jego td. Dawniej
+  // [onclick*=…] na całym dokumencie: bez indeksu, porównanie podciągu w każdym
+  // atrybucie onclick strony — najdroższy moduł ticka w logach 03–09.11
+  // (0,39 ms/tick; benchmark bench-selektory.html 90–680 µs → ≤1 µs).
+  // Treść ostrzeżenia (bledy z ZUS) jest w #tb_komunikat_div — frazę
+  // sprawdzamy tylko tam. Dawniej w tekście całego <body>: fraza z dowolnego
+  // miejsca strony (także z <script>) puszczała Wyślij przy INNYM ostrzeżeniu
+  // (test-ezla-podglad.html, krok 03, na 3.152).
+  function findEzlaOstrzezenie() {
+    for (const t of document.querySelectorAll('#tb_komunikat_div')) {
+      const td = t.parentElement;
+      if (!td) continue;
+      for (const el of td.querySelectorAll('a[onclick*="f_ezla_nadajserienr"]')) {
+        if (normLabel(el.textContent) !== 'Wyślij') continue;
+        if (!isOverlayElementVisible(el)) continue;
+        return { btn: el, tresc: t };
+      }
     }
     return null;
   }
 
   function modEzlaOstrzezenieWyslij() {
-    const btn = findEzlaOstrzezenieWyslij();
-    if (!btn) {
+    const okno = findEzlaOstrzezenie();
+    if (!okno) {
       ezlaOstrzezenieClicked = false;
       return;
     }
     if (ezlaOstrzezenieClicked) return;
     ezlaOstrzezenieClicked = true;
-    if (!(document.body.textContent || '').toLowerCase().includes(EZLA_OSTRZEZENIE_TEXT)) return;
+    if (!(okno.tresc.textContent || '').toLowerCase().includes(EZLA_OSTRZEZENIE_TEXT)) {
+      dbg('modEzlaOstrzezenieWyslij: okno z Wyślij bez frazy „' + EZLA_OSTRZEZENIE_TEXT + '” — nie klikam');
+      return;
+    }
 
     dbg('modEzlaOstrzezenieWyslij: klik Wyślij (OSTRZEŻENIE — przerwa między zwolnieniami)');
-    btn.click();
+    okno.btn.click();
   }
   // --- POWÓD EDYCJI (auto „X” + Zapisz) ---
 
@@ -6626,9 +6644,17 @@
     // Nie getElementById — po kilku otwarciach Serum zostawia w DOM stare,
     // niewidoczne kopie popupu z tym samym id (jak przy „PODGLĄD WYNIKÓW”),
     // a getElementById zwróciłby pierwszą (potencjalnie martwą) kopię.
-    const candidates = document.querySelectorAll('[id^="podgladWydruku"]');
-    const found = [...candidates].find((el) => isOverlayElementVisible(el));
-    if (found) return found;
+    // Nagłówek to tytuł okna uf_pokaz_div: <span class="h3_tytul"
+    // id="podgladWydruku…"> (zrzuty serum-diag 27.10–10.11: 3 warianty, zawsze
+    // span.h3_tytul w div.przegladarka; .h3_tytul na stronie 0–2). Żywa lista
+    // klas przelicza się tylko, gdy do DOM wchodzi/wychodzi element tej klasy
+    // (otwarcie/zamknięcie okna). Dawne [id^="podgladWydruku"] szło po całym
+    // dokumencie przy każdym wywołaniu, a koszt rośnie z liczbą elementów z id
+    // (logi 03–09.11: modPodgladWydrukuFokus 0,31 ms/tick; benchmark z gęstymi
+    // id bench-selektory-id.html 105–762 µs → ≤1 µs).
+    for (const el of document.getElementsByClassName('h3_tytul')) {
+      if (el.id.startsWith('podgladWydruku') && isOverlayElementVisible(el)) return el;
+    }
 
     // Drugi wariant tego samego rodzaju okna: generyczny popup Serum
     // (.popup-window.show, ten sam komponent co np. Recepty/e-Recepty) z
