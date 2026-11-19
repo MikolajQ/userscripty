@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.154.0
+// @version      3.155.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.154.0';
+  const SCRIPT_VERSION = '3.155.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -2272,7 +2272,10 @@
   //   <table class="pas_naw">…<a class="a_akc" onclick="uf_schowaj_div();
   //     f_ezla_nadajserienr(id)">Wyślij</a><a …>Anuluj</a>…</table>
   // i to jedyne miejsce w źródłach z f_ezla_nadajserienr w onclick. Dlatego
-  // szukamy przez indeks id (#tb_komunikat_div) i dopiero w jego td. Dawniej
+  // szukamy przez getElementById('tb_komunikat_div') (≤0,2 µs; tak jak jQ('#…')
+  // samego Serum — jedno takie okno) i dopiero w jego td. 3.153–3.154 miały
+  // querySelectorAll('#tb_komunikat_div') — w trybie quirks Serum to pełny
+  // przelot dokumentu (18–1280 µs, bench-quirks-listy.html). Dawniej
   // [onclick*=…] na całym dokumencie: bez indeksu, porównanie podciągu w każdym
   // atrybucie onclick strony — najdroższy moduł ticka w logach 03–09.11
   // (0,39 ms/tick; benchmark bench-selektory.html 90–680 µs → ≤1 µs).
@@ -2281,14 +2284,13 @@
   // miejsca strony (także z <script>) puszczała Wyślij przy INNYM ostrzeżeniu
   // (test-ezla-podglad.html, krok 03, na 3.152).
   function findEzlaOstrzezenie() {
-    for (const t of document.querySelectorAll('#tb_komunikat_div')) {
-      const td = t.parentElement;
-      if (!td) continue;
-      for (const el of td.querySelectorAll('a[onclick*="f_ezla_nadajserienr"]')) {
-        if (normLabel(el.textContent) !== 'Wyślij') continue;
-        if (!isOverlayElementVisible(el)) continue;
-        return { btn: el, tresc: t };
-      }
+    const t = document.getElementById('tb_komunikat_div');
+    const td = t?.parentElement;
+    if (!td) return null;
+    for (const el of td.querySelectorAll('a[onclick*="f_ezla_nadajserienr"]')) {
+      if (normLabel(el.textContent) !== 'Wyślij') continue;
+      if (!isOverlayElementVisible(el)) continue;
+      return { btn: el, tresc: t };
     }
     return null;
   }
@@ -4777,24 +4779,26 @@
   // chowanie dymków i menu — dlatego bez stopPropagation (dymek ma zniknąć).
   // Nasłuch mouseover z 3.150 zastąpiony oznaczaniem w ticku (pomiar w Serum:
   // 57 zdarzeń/min po 0,44 µs — mało, ale to był jedyny stały koszt funkcji).
-  // Koszt kroku (Firefox 159, ~/serum-audyt/test-ipom/bench-lab-*.html):
-  // querySelectorAll('#id') idzie przez indeks id dokumentu — stałe ~0,4 µs
-  // niezależnie od wielkości DOM-u (2–60 tys. węzłów) i liczby tabel, zwraca też
-  // duplikaty; tabela bez zmian 0,07 µs; oznaczenie nowej (10 wierszy) 8,5 µs.
-  // tabeleStrony().lab to tylko PIERWSZA tabela, a tu potrzebne wszystkie —
-  // stąd osobne zapytanie (ten sam indeks id, ten sam koszt).
+  // Koszt kroku: Serum działa w trybie quirks (compatMode BackCompat w zrzutach
+  // serum-diag), a w nim Firefox NIE używa indeksu id w querySelector(All)('#id')
+  // — przechodzi cały dokument: 18 / 184 / 780–1280 µs przy 2 / 20 / 60 tys.
+  // węzłów (~/serum-audyt/test-ipom/bench-quirks-listy.html). 3.151–3.154 płaciły
+  // to na każdym ticku; pomiar „0,4 µs” z 18.11 był na stronie testowej
+  // w trybie standardowym. Teraz jedna żywa lista klas wierszy z całego
+  // dokumentu (≤0,23 µs także po mutacjach) i ocena każdego wiersza raz —
+  // Serum nie zmienia wierszy na miejscu, więc nowy wiersz = nowy węzeł.
+  // Duplikaty tabel (wizyta, podsumowanie) obsłużone same: liczą się wiersze.
   const LAB_WIERSZ = '#tab_zlecenia_lab tr.tr_zlecenie';
   const LAB_EDYTUJ = 'td.td_akcja a[href^="javascript:f_js_lab_zlecenie("]';
-  const labOznaczone = new WeakMap(); // tabela → { wiersze (żywa lista), n }
+  const labWiersze = document.getElementsByClassName('tr_zlecenie');
+  const labOcenione = new WeakSet();
 
   function modLabWierszEdytuj() {
-    for (const t of document.querySelectorAll('#tab_zlecenia_lab')) {
-      const z = labOznaczone.get(t);
-      if (z && z.wiersze.length === z.n) continue;
-      const wiersze = z ? z.wiersze : t.getElementsByClassName('tr_zlecenie');
-      labOznaczone.set(t, { wiersze, n: wiersze.length });
+    for (const r of labWiersze) {
+      if (labOcenione.has(r)) continue;
+      labOcenione.add(r);
       // klasa na TR to szum dla obserwatora (isNoiseMutation) — nie wywoła ticka
-      for (const r of wiersze) r.classList.toggle('serum-lab-edytuj', !!r.querySelector(LAB_EDYTUJ));
+      if (r.closest('#tab_zlecenia_lab') && r.querySelector(LAB_EDYTUJ)) r.classList.add('serum-lab-edytuj');
     }
   }
 
@@ -6368,8 +6372,11 @@
   // w logach z 12 sesji 03–09.11: 0,22–0,45 ms na tick, 45,8 s z 278,9 s całego
   // ticka (16%, najdroższy krok skryptu). Benchmark (Firefox 159, 1:1 ta sama
   // klasyfikacja, 7,8–40 tys. el., 183–426 tabel, ~/serum-audyt/test-ipom/
-  // bench-tabele.html): stary 50–104 µs, po wstawieniu tabeli do DOM 128–768 µs;
-  // nowy 0,8–1,2 µs niezależnie od wielkości strony. Pamięć w obrębie uiTick().
+  // bench-tabele.html): stary 50–104 µs, po wstawieniu tabeli do DOM 128–768 µs.
+  // Tabela zleceń przez getElementById (≤0,2 µs; zwraca pierwszą w kolejności
+  // dokumentu — tę samą co dawna pętla). 3.152–3.154 brały ją przez
+  // querySelectorAll('#tab_zlecenia_lab'), a w trybie quirks Serum to pełny
+  // przelot dokumentu (18–1280 µs, bench-quirks-listy.html). Pamięć w obrębie uiTick().
   let tabeleTickCache = null;
   function tabeleStrony() {
     if (tabeleTickCache) return tabeleTickCache;
@@ -6380,9 +6387,8 @@
         if (t.tagName === 'TABLE' && isWizytyListTable(t)) wynik.wizyty.push(t);
       }
     }
-    for (const t of document.querySelectorAll('#tab_zlecenia_lab')) {
-      if (isLabOrdersTable(t)) { wynik.lab = t; break; }
-    }
+    const lab = document.getElementById('tab_zlecenia_lab');
+    if (lab && isLabOrdersTable(lab)) wynik.lab = lab;
     if (visCache) tabeleTickCache = wynik;
     return wynik;
   }
