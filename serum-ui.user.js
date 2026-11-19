@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.155.0
+// @version      3.156.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.155.0';
+  const SCRIPT_VERSION = '3.156.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -6680,16 +6680,69 @@
 
   // --- IPOM: Esc pyta o potwierdzenie zamiast od razu zamykać ---
 
+  function ipomPopupNaWierzchu() {
+    // Okna otwierane z karty IPOM (ICD9 → div#ListIcd9Popup, Słownik →
+    // div#listDictionaryIcd9Popup, ICD10, Z historii wizyt, PIN…) to popupy
+    // serum2: ser.openPopupAjax dokleja div.popup-window na koniec .serum2body
+    // i pokazuje go klasą `show` (z-index 211, karta IPOM w _uf_przegladarka2:
+    // 210 — ipom-esc-diag 19.11). Kolejność w DOM = kolejność otwierania, więc
+    // ostatni widoczny jest na wierzchu. Żywa lista klas — bez przelotu po DOM.
+    const popupy = document.getElementsByClassName('popup-window');
+    for (let i = popupy.length - 1; i >= 0; i--) {
+      const p = popupy[i];
+      if (p.classList.contains('show') && isOverlayElementVisible(p)) return p;
+    }
+    return null;
+  }
+
   function bootIpomEsc() {
     // Omyłkowy Esc w widoku IPOM (nagłówek <span id="ipom" class="h3_tytul">IPOM</span>,
     // zamykany przez div.div_close → uf_schowaj_div()) zamykał go bez zapisu.
     // Ten sam mechanizm co przy zaświadczeniach: capture + natywny confirm().
+    //
+    // Esc w Serum robi DWIE rzeczy naraz (ipom-esc-diag 19.11):
+    //   document.onkeydown = in_obsl_klawisz → uf_schowaj_div() zamyka
+    //     najwyższe okno uf_pokaz_div — czyli całą kartę IPOM;
+    //   jQ(window).keydown → klik .popup-close popupu ser.popupsList.last()
+    //     i ser.popupsList.pop().
+    // Esc w oknie ICD9/Słownik nad kartą zamykał więc i okno, i kartę (a my
+    // pytaliśmy o zamknięcie IPOM). Gdy nad kartą jest popup, zatrzymujemy Esc
+    // i robimy tylko to drugie: krzyżyk popupu (jego handler Serum usuwa okno,
+    // ale listy nie rusza) + zdjęcie go z ser.popupsList, jak robi Serum.
     window.addEventListener(
       'keydown',
       (e) => {
         if (e.key !== 'Escape') return;
-        const naglowek = document.querySelector('span#ipom.h3_tytul');
+        // Tytuły okien uf_pokaz_div: span.h3_tytul (0–2 na stronie) — żywa lista
+        // klas zamiast querySelector('#ipom'), który w trybie quirks przelatuje DOM.
+        let naglowek = null;
+        for (const el of document.getElementsByClassName('h3_tytul')) {
+          if (el.id === 'ipom') {
+            naglowek = el;
+            break;
+          }
+        }
         if (!naglowek || !isOverlayElementVisible(naglowek)) return;
+        const popup = ipomPopupNaWierzchu();
+        if (popup) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          const krzyzyk = popup.querySelector('.popup-close');
+          if (!krzyzyk) {
+            dbg('bootIpomEsc: popup #' + popup.id + ' nad kartą bez .popup-close — Esc zatrzymany, karta zostaje');
+            return;
+          }
+          krzyzyk.click();
+          try {
+            const uw = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+            const lista = uw.ser?.popupsList;
+            if (lista && lista.length && lista[lista.length - 1] === popup.id) lista.pop();
+          } catch (err) {
+            dbg('bootIpomEsc: ser.popupsList — ' + (err?.message || err));
+          }
+          dbg('bootIpomEsc: Esc → zamknięty tylko popup #' + popup.id + ' (karta IPOM zostaje)');
+          return;
+        }
         if (window.confirm('Czy na pewno zamknąć IPOM bez zapisu?')) {
           dbg('bootIpomEsc: potwierdzono zamknięcie IPOM przez Esc');
           return;
