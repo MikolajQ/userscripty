@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.153.0
+// @version      3.154.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.153.0';
+  const SCRIPT_VERSION = '3.154.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -4557,7 +4557,8 @@
   const rowStyle = document.createElement('style');
   rowStyle.textContent = 'td.serum-pacjent-hit { cursor: pointer; }' +
     ' #div_pole_historia_lista tr[onmouseover] { cursor: pointer; }' +
-    ' #tab_zlecenia_lab tr.serum-lab-edytuj > td:not(.td_akcja) { cursor: pointer; }';
+    ' #tab_zlecenia_lab tr.serum-lab-edytuj > td:not(.td_akcja) { cursor: pointer; }' +
+    ' #wize_sekcja_ipom tr.serum-ipom-edytuj > td:not(.td_akcja) { cursor: pointer; }';
   document.documentElement.appendChild(rowStyle);
 
   // table.rows/tHead/tBodies to natywne, „gotowe” kolekcje przeglądarki —
@@ -4810,6 +4811,66 @@
     const edytuj = row.querySelector(LAB_EDYTUJ);
     if (!edytuj) return;
     dbg('laboratorium: klik wiersz → Edytuj (' + row.id + ')');
+    edytuj.click();
+  }, true);
+
+  // --- IPOM (lista w zakładce IPOM wizyty): klik w wiersz → Edytuj ---
+  // Dane: ipom-wiersz-diag 19.11.2026 (serum-audyt: dane/serum-ipom-wiersz-diag-2026-11-19-08-54-16.txt):
+  //   <div id="wize_sekcja_ipom" class="wiznow_div_sekcja">
+  //     <table class="pas_naw">… a#ipom_akcja „Dodaj” …</table>
+  //     <div id="div_lista_dane"><input type="hidden" id="hid_czy_regulamin">
+  //       <table class="wiersz serum2body"><tbody>
+  //         <tr class="tr_naglowek"><th>Lp.</th>…<th>Akcja</th></tr>
+  //         <tr class="tr_nieparzysty"><td>…</td> ×6 (sam tekst, bez linków i onclick)
+  //           <td class="td_akcja"><div class="fourBtnHolder">
+  //             <span><a style="…" onclick="f_dodaj_ipom(<id>,'N', 'I','N');">Edytuj</a></span>
+  //             <span><a style="…" onclick="f_dodaj_ipom(<id>,'N', 'I','T');">Podgląd</a></span>
+  //             <span><a style="…" onclick="f_dodaj_ipom('','N', 'I','N',<id>);">Kopiuj</a></span>
+  //             [<span><a onclick="f_pokaz_eDokumentCDA(…);f_stop_bubble(event);">eDokument</a></span>] (wysłany)
+  //           </div><span class="showInfo" onclick="…">+</span>
+  //           <span class="userInfoBox">Wstaw + Status/Anuluj (wysłany) albo Usuń (niepodpisany)</span></td>
+  // f_dodaj_ipom(IPOMId, czy_nowy, typ, czy_podglad = "N", kopia_id): Edytuj,
+  // Podgląd i Kopiuj różnią się tylko końcem wywołania — 'N'); / 'T'); / <id>);
+  // — więc „Edytuj” rozpoznaje sam atrybut, bez czytania tekstu. Linki nie mają
+  // href; a.click() i tak uruchamia onclick (jak klik myszą: Serum przy tym
+  // samo zapisuje wizytę roboczo — f_wiz_zapisz_robocze w f_dodaj_ipom).
+  // Oba rodzaje wierszy w zrzucie (wysłany, niepodpisany) mają „Edytuj”;
+  // wiersz bez niego (np. anulowany — niewidziany) zostaje bez kursora i bez akcji.
+  // Serum podmienia CAŁY div#div_lista_dane (razem z table.pas_naw) po Zapisz,
+  // Usuń i wejściu w zakładkę; Edytuj/Podgląd/„+” listy nie przebudowują
+  // („+” dokleja tylko wierszowi klasę activeRow — szum dla obserwatora).
+  // div#div_lista_dane był jeden w DOM, ale nazwa jest ogólna — bierzemy tylko
+  // dziecko sekcji IPOM (2 dzieci, bez selektora). Na wierszu i komórkach brak
+  // zdarzeń; na document tylko chowanie dymków i menu — bez stopPropagation.
+  const IPOM_WIERSZ = '#wize_sekcja_ipom > #div_lista_dane tr';
+  const IPOM_EDYTUJ = 'td.td_akcja a[onclick^="f_dodaj_ipom("][onclick$="\'N\');"]';
+  const ipomListyOznaczone = new WeakMap(); // tabela → liczba wierszy przy oznaczaniu
+
+  function modIpomWierszEdytuj() {
+    const sekcja = document.getElementById('wize_sekcja_ipom');
+    if (!sekcja) return;
+    let div = null;
+    for (const c of sekcja.children) if (c.id === 'div_lista_dane') { div = c; break; }
+    const tabela = div ? div.getElementsByTagName('table')[0] : null;
+    if (!tabela || ipomListyOznaczone.get(tabela) === tabela.rows.length) return;
+    ipomListyOznaczone.set(tabela, tabela.rows.length);
+    // klasa na TR to szum dla obserwatora (isNoiseMutation) — nie wywoła ticka
+    for (const r of tabela.rows) r.classList.toggle('serum-ipom-edytuj', !!r.querySelector(IPOM_EDYTUJ));
+  }
+
+  document.addEventListener('click', (event) => {
+    if (event.button !== 0 || event.detail > 1) return;
+    const t = event.target;
+    if (!(t instanceof Element)) return;
+    const row = t.closest(IPOM_WIERSZ);
+    if (!row) return;
+    const klikalny = t.closest('a, button, input, select, textarea, label, [onclick], td.td_akcja');
+    if (klikalny && row.contains(klikalny)) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && row.contains(sel.anchorNode)) return;
+    const edytuj = row.querySelector(IPOM_EDYTUJ);
+    if (!edytuj) return;
+    dbg('IPOM: klik wiersz → Edytuj');
     edytuj.click();
   }, true);
 
@@ -6284,6 +6345,7 @@
     ['modHistoriaWizytFiltr', modHistoriaWizytFiltr],
     ['modLabKopiujWyniki', modLabKopiujWyniki],
     ['modLabWierszEdytuj', modLabWierszEdytuj],
+    ['modIpomWierszEdytuj', modIpomWierszEdytuj],
     ['modZapiszDrukuj', modZapiszDrukuj],
     ['modPodgladWydrukuFokus', modPodgladWydrukuFokus],
     ['markPatientCells', markPatientCells],
@@ -6406,6 +6468,7 @@
     'modHistoriaWizytFiltr',
     'markPatientCells',
     'modLabWierszEdytuj',
+    'modIpomWierszEdytuj',
     'modIpomKarta',
     'modIpomEtykieta',
     'modIpomPorada',
