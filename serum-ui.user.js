@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.156.0
+// @version      3.157.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.156.0';
+  const SCRIPT_VERSION = '3.157.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -3302,7 +3302,23 @@
       szukaj: ['probnp', 'pro bnp', 'pro-bnp', 'ntpobnp', 'nt-pobnp', 'nt pobnp'],
       procedura: 'BNP (NT-PRO-BNP)',
     },
+    // Wskaźnik albumina/kreatynina w moczu: w wynikach „ACR” (katalog badań
+    // Serum: „ACR wskaźnik alb/krea”), czasem „UACR”. Trzy litery jako zwykły
+    // podciąg trafiałyby w środek innych słów, dlatego `wzorzec` — „acr”
+    // tylko jako osobny wyraz. Pozycja słownika z inspektora 20.11.2026:
+    // td.l „UACR (WSKAŹNIK ALBUMINA/KREATYNINA W MOCZU)”, 5.01.00.0000176,
+    // kod świadczenia 22, ICD-9 I09*1.
+    {
+      wzorzec: /(?<![\p{L}\d])u?acr(?![\p{L}\d])/u,
+      procedura: 'UACR (WSKAŹNIK ALBUMINA/KREATYNINA W MOCZU)',
+    },
   ];
+
+  // Reguła ma albo listę podciągów `szukaj`, albo `wzorzec` (RegExp bez
+  // flagi g — test() nie trzyma wtedy stanu). `tresc` już po normalize().
+  function regulaPasuje(r, tresc) {
+    return r.wzorzec ? r.wzorzec.test(tresc) : r.szukaj.some((s) => tresc.includes(s));
+  }
 
   const PROC_DOD_SELEKTOR_CHK = 'input[type="checkbox"][onclick*="f_poz_dodaj_dod_prod"]';
   // Pisanie z ręki wymaga cierpliwości — treść dopiero powstaje. Ale
@@ -3398,7 +3414,7 @@
     const tresc = normalize(tekst);
     if (!tresc) return [];
     return PROC_DOD_REGULY.filter(
-      (r) => r.szukaj.some((s) => tresc.includes(s)) &&
+      (r) => regulaPasuje(r, tresc) &&
         !procDodUsunieteRecznie.has(r.procedura) &&
         !proceduraJuzDodana(r.procedura)
     );
@@ -3600,7 +3616,8 @@
 
     const brakuje = brakujaceProcedury(tekst);
     if (!brakuje.length) {
-      const trafienia = PROC_DOD_REGULY.filter((r) => r.szukaj.some((s) => normalize(tekst).includes(s)));
+      const tresc = normalize(tekst);
+      const trafienia = PROC_DOD_REGULY.filter((r) => regulaPasuje(r, tresc));
       const zablokowane = trafienia.filter((r) => procDodUsunieteRecznie.has(r.procedura)).map((r) => r.procedura);
       const juzSa = trafienia.filter((r) => !procDodUsunieteRecznie.has(r.procedura)).map((r) => r.procedura);
       if (juzSa.length) {
