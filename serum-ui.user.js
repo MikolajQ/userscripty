@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.160.0
+// @version      3.161.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
-// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
+// @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, UACR wyliczany z wklejonej albuminy i kreatyniny w moczu, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
 // @match        https://*.serum.com.pl/*
 // @grant        GM_registerMenuCommand
 // @grant        GM_getValue
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.160.0';
+  const SCRIPT_VERSION = '3.161.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -3682,7 +3682,15 @@
       // PRZY ELEMENCIE (WeakMap), nie w zmiennej modułu — wcześniej dowolny
       // tick potrafił go nadpisać świeżo wklejoną treścią i zmiana przepadała.
       procDodBazowyTekst.set(opis, opis.value || '');
-      opis.addEventListener('paste', () => zaplanujSprawdzenieProcedur(opis, true));
+      opis.addEventListener('paste', () => {
+        // Treść sprzed wklejenia — po niej poznamy, które wiersze są NOWE.
+        // setTimeout 0: domyślna akcja wklejenia wstawia tekst zaraz po
+        // zdarzeniu, więc w kolejnym zadaniu pole ma już nową treść, a
+        // sprawdzenie procedur (200 ms) zobaczy dopisany wiersz UACR.
+        const przed = opis.value || '';
+        setTimeout(() => uzupelnijUacr(opis, przed), 0);
+        zaplanujSprawdzenieProcedur(opis, true);
+      });
       opis.addEventListener('change', () => zaplanujSprawdzenieProcedur(opis, true));
       opis.addEventListener('input', () => zaplanujSprawdzenieProcedur(opis, false));
       dbg('modProceduryDodatkowe: obserwuję pole BADANIE PRZEDMIOTOWE (na start ' + (opis.value || '').length + ' znaków)');
@@ -3699,6 +3707,95 @@
     // treść pola własnymi funkcjami, a wtedy „input” nie leci). Koszt: jeden
     // odczyt właściwości na tick — bez układu strony i bez serializacji DOM.
     if ((opis.value || '') !== procDodBazowyTekst.get(opis)) upewnijSieZeSprawdzeniZaplanowane(opis);
+  }
+
+  // --- UACR wyliczany z wklejonych wyników (3.161) ---
+  // lab-to-serum kopiuje wiersze „nazwa  wartość jednostka (normy)”, np.
+  //   Albumina w moczu  <0.30 mg/dl (do 2.00)
+  //   Kreatynina w moczu  36.20 mg/dl (28.00 - 217.00)
+  // Po wklejeniu obu do BADANIA PRZEDMIOTOWEGO dopisujemy za ich akapitem,
+  // po jednym pustym wierszu: „UACR  < 8,29 mg/g (do 30)”.
+  // UACR [mg/g] = albumina [mg/l] / kreatynina [g/l]; norma KDIGO A1 < 30.
+  // Jednostki tylko znane — inna jednostka = nic nie liczymy (log).
+  const UACR_RE_ALB = /^[ \t]*(?:mikro)?albumina w moczu[ \t]+([<>]?)[ \t]*(\d+(?:[.,]\d+)?)[ \t]*(mg\/dl|mg\/l)\b/im;
+  const UACR_RE_KREA = /^[ \t]*kreatynina w moczu[ \t]+([<>]?)[ \t]*(\d+(?:[.,]\d+)?)[ \t]*(mg\/dl|mmol\/l|[µμu]mol\/l)(?![\p{L}])/imu;
+  const UACR_NA_MG_L = { 'mg/dl': 10, 'mg/l': 1 };
+  const UACR_NA_G_L = { 'mg/dl': 0.01, 'mmol/l': 0.11312, 'µmol/l': 0.00011312 };
+  const UACR_RE_WIERSZ_ACR = /^[ \t]*u?acr(?![\p{L}\d])/imu;
+  const UACR_NORMA = 30;
+  const UACR_ZNACZNIK = ' <<-------'; // jak outOfRangeMarker w lab-to-serum
+
+  function uacrLiczba(s) {
+    return parseFloat(s.replace(',', '.'));
+  }
+
+  // Czysta funkcja: zwraca { pozycja, wstaw } albo { pomin: powód } / null.
+  function wyliczWstawienieUacr(tekst, przed) {
+    const a = UACR_RE_ALB.exec(tekst);
+    const k = UACR_RE_KREA.exec(tekst);
+    if (!a || !k) return null;
+    // Tylko świeżo wklejone wyniki — nie stare wiersze zastane w polu.
+    if (przed.includes(a[0].trim()) && przed.includes(k[0].trim())) return null;
+
+    // Akapit (wiersze bez pustego między nimi) z oboma wynikami.
+    const poczatek = Math.min(a.index, k.index);
+    const koniecWiersza = Math.max(a.index + a[0].length, k.index + k[0].length);
+    const miedzy = tekst.slice(poczatek, koniecWiersza);
+    if (/\n[ \t]*\n/.test(miedzy)) return { pomin: 'albumina i kreatynina w różnych akapitach' };
+    let koniec = tekst.indexOf('\n', koniecWiersza);
+    if (koniec < 0) koniec = tekst.length;
+    // Rozciągnij do końca akapitu (kolejne niepuste wiersze).
+    while (koniec < tekst.length) {
+      const nast = tekst.indexOf('\n', koniec + 1);
+      const wiersz = tekst.slice(koniec + 1, nast < 0 ? tekst.length : nast);
+      if (!wiersz.trim()) break;
+      koniec = nast < 0 ? tekst.length : nast;
+    }
+    let start = tekst.lastIndexOf('\n', poczatek - 1) + 1;
+    // UACR/ACR już jest w akapicie albo zaraz za nim — nie dublujemy.
+    const poAkapicie = tekst.slice(koniec).replace(/^\s+/, '');
+    const pierwszyPo = poAkapicie.split('\n', 1)[0];
+    if (UACR_RE_WIERSZ_ACR.test(tekst.slice(start, koniec)) || UACR_RE_WIERSZ_ACR.test(pierwszyPo)) {
+      return { pomin: 'UACR/ACR już jest przy wynikach' };
+    }
+
+    if (k[1]) return { pomin: 'kreatynina z „' + k[1] + '” — iloraz nieokreślony' };
+    const jA = a[3].toLowerCase();
+    const jK = k[3].toLowerCase().replace(/^[μu]/, 'µ');
+    const albMgL = uacrLiczba(a[2]) * UACR_NA_MG_L[jA];
+    const kreaGL = uacrLiczba(k[2]) * UACR_NA_G_L[jK];
+    if (!(albMgL >= 0) || !(kreaGL > 0)) return { pomin: 'wartości nie do policzenia' };
+    const uacr = albMgL / kreaGL;
+
+    let wartosc = (a[1] ? a[1] + ' ' : '') + uacr.toFixed(2).replace('.', ',');
+    let wiersz = 'UACR  ' + wartosc + ' mg/g (do ' + UACR_NORMA + ')';
+    if (a[1] !== '<' && uacr >= UACR_NORMA) wiersz += UACR_ZNACZNIK;
+    return { pozycja: koniec, wstaw: '\n\n' + wiersz, uacr };
+  }
+
+  function uzupelnijUacr(opis, przed) {
+    if (!opis?.isConnected) return;
+    const tekst = opis.value || '';
+    if (tekst === przed) return;
+    const w = wyliczWstawienieUacr(tekst, przed);
+    if (!w) return;
+    if (w.pomin) { dbg('UACR: nie wyliczam — ' + w.pomin); return; }
+
+    const kursor = opis.selectionEnd;
+    let wstawiono = false;
+    // execCommand zachowuje cofanie (Ctrl+Z) i sam wysyła 'input'.
+    if (document.activeElement === opis) {
+      opis.setSelectionRange(w.pozycja, w.pozycja);
+      try { wstawiono = document.execCommand('insertText', false, w.wstaw); } catch (_) {}
+    }
+    if (!wstawiono || opis.value === tekst) {
+      opis.value = tekst;
+      opis.setRangeText(w.wstaw, w.pozycja, w.pozycja, 'end');
+      opis.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    const nowyKursor = kursor > w.pozycja ? kursor + w.wstaw.length : (kursor === w.pozycja ? kursor + w.wstaw.length : kursor);
+    opis.setSelectionRange(nowyKursor, nowyKursor);
+    dbg('UACR: dopisano „' + w.wstaw.trim() + '” (' + w.uacr.toFixed(3) + ' mg/g)');
   }
 
   // --- AUTO LOGIN (osobny watcher) ---
