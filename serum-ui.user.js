@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Serum — automatyzacja (zbiorczy)
 // @namespace    local.serum-ui
-// @version      3.159.0
+// @version      3.160.0
 // @updateURL    https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @downloadURL  https://raw.githubusercontent.com/MikolajQ/userscripty/main/serum-ui.user.js
 // @description  WYNIKI OPERACJI, SMS (kody wysłanych eDokumentów nad „eDok (SMS)”: zielony wysłany / pomarańczowy w kolejce / czerwony błąd, dymek tylko przy wejściu do kolejki i przy błędzie), Podpisz e-receptę, eZLA OSTRZEŻENIE (przerwa między zwolnieniami) auto Wyślij, Powód edycji, Podpisz (podpis elektroniczny: PIN + Zapamiętaj), LUX MED, login, auto Wizyty (EDM), klik wiersz→Edytuj, klik wiersz historii pola→Wstaw, klik wiersz zlecenia laboratoryjnego→Edytuj, toast, mini paginacja obok Filtruj, Historia wizyt wczytywana w tle + Rozwiń, auto kod ICD-9 wg uwag z terminarza, auto OK dialogi, IPOM (etykieta w nagłówku wizyty, stratyfikacja „stabilny” i wizyta kontrolna na karcie, badania „Najszybciej jak to możliwe”, wizyty „Po wykonaniu zleconych badań”, po podpisie DANE WIZYTY), „Zapisz i drukuj” w zleceniu laboratoryjnym (2 strony na poziomej kartce A4), „Porada kompleksowa” przy własnym IPOM-ie z dziś, przekierowanie z błędu 404, sprzątanie przyklejonych nagłówków Serum (płynne przewijanie) (dawniej 3 osobne skrypty — połączone dla wydajności, jeden wspólny obserwator DOM zamiast kilku)
@@ -26,7 +26,7 @@
   // menu „Pokaż log debug”) od razu pokaże, czy to wciąż ten sam, „żywy”
   // egzemplarz skryptu, czy strona się w międzyczasie przeładowała.
   const SCRIPT_BOOT_AT = Date.now();
-  const SCRIPT_VERSION = '3.159.0';
+  const SCRIPT_VERSION = '3.160.0';
 
   // Uruchamia funkcję `fn` w kontekście strony (wstrzyknięty <script>), a nie
   // w kontekście, który Tampermonkey dał skryptowi. Domyślnie (bez @sandbox)
@@ -1552,9 +1552,23 @@
     return kody;
   }
 
-  // Kody z listy użytkownika znalezione w obu sekcjach (puste = brak sugestii).
+  // Rozpoznania BIEŻĄCEJ wizyty (zrzut rozpoznanie-wizyty-diag 27.11.2026):
+  //   td#td_kontener_rozpoznania_icd10 > … > input#wizb_rozpoznanie_N_t (pole tekstowe)
+  //                                        + input#wizb_rozpoznanie_N_w[type=hidden] (sam kod, np. „I10”)
+  // N = 1 (główne) … 6 (współistniejące). Serum ustawia ATRYBUT value pola _w
+  // przy wyborze z podpowiedzi — główny obserwator (attributeFilter value) budzi tick.
+  // Podczas pisania _w chwilowo ma niepełny kod (np. „I1”) — ipomKodWskazany go odrzuci.
+  const IPOM_WIZYTA_ICD_MAX = 6;
+
+  // Kody z listy użytkownika: bieżąca wizyta + obie sekcje historii (puste = brak sugestii).
   function ipomKodySugestii() {
-    let wszystkie = [];
+    const wszystkie = [];
+    for (let i = 1; i <= IPOM_WIZYTA_ICD_MAX; i++) {
+      const pole = document.getElementById('wizb_rozpoznanie_' + i + '_w');
+      if (!pole) break;
+      const kod = pole.value.trim().toUpperCase();
+      if (kod && ipomKodWskazany(kod) && wszystkie.indexOf(kod) < 0) wszystkie.push(kod);
+    }
     for (const id of IPOM_SEKCJE_ICD) {
       const tabela = document.getElementById(id)?.closest('table.form')?.querySelector('table.dane');
       if (!tabela) continue;
@@ -1567,7 +1581,7 @@
     ipomWynik = w;
     dbg('modIpomEtykieta: ' + skad + ' — IPOM: ' + w.ile + ', z ' + w.rok + ': ' + w.wRoku +
       (w.ile ? ', ostatnia zmiana ' + w.zmiana + (w.bezModyfikacji ? ' (BRAK kolumny „Data modyfikacji”)' : '') +
-        ' → etykieta ' + (w.zielona ? 'zielona' : 'czerwona') : ' → biała tylko przy kodach ICD z sekcji rozpoznań') +
+        ' → etykieta ' + (w.zielona ? 'zielona' : 'czerwona') : ' → biała tylko przy kodach ICD (rozpoznania wizyty i historii)') +
       (w.dzis.length ? '; z dziś: ' + w.dzis.length : ''));
     rysujEtykieteIpom();
     // Lista to zdarzenie danych, nie zmiana DOM strony (etykietę obserwator
@@ -1610,7 +1624,7 @@
       td.appendChild(el);
     }
     const tytul = kodySug
-      ? 'Warto rozważyć IPOM: pacjent nie ma jeszcze IPOM, a w rozpoznaniach jest ' + kodySug.join(', ')
+      ? 'Warto rozważyć IPOM: pacjent nie ma jeszcze IPOM, a w rozpoznaniach (wizyta i historia) jest ' + kodySug.join(', ')
       : w.zielona
       ? 'Można wystawić nowy IPOM: nowy rok i minęło ≥10 mies. (ostatni utworzony ' + w.ostatni + ipomZmianaOpis(w) + ')'
       : w.wRoku
